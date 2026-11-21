@@ -5,6 +5,7 @@ import { readFile, writeFile, mkdir, unlink, stat } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import vm from 'node:vm';
 import { transcribe, sonioxConfigured } from './soniox.mjs';
+import { runChecks } from './rules.mjs';
 
 const DIR = new URL('./data/', import.meta.url);
 const AUDIO = new URL('./audio/', DIR);
@@ -70,9 +71,49 @@ const fail = (status, msg) => Object.assign(new Error(msg), { status });
 const plain = transcript => transcript.map(({ id, speaker, text }) => ({ id, speaker, text }));
 const journalText = r => r.docs.journal?.data?.sections.map(s => `${s.heading}: ${s.claims.map(c => c.text).join(' ')}`).join('\n') || '';
 const browserLines = segs => segs.map((x, i) => ({ id: 'U' + (i + 1), speaker: '?', text: x.text.trim(), start: x.start, words: x.text.trim().split(/\s+/).map(w => ({ w, c: x.conf })) }));
-const NEEDS = { journal: null, fk: 'journal', arb: 'journal', recept: null, lab: null, rtg: null, remiss: null, uppfoljning: null, patientinfo: null };
+// MOCKED integrations with the systems Region Skåne primary care uses (PMO, Webcert, eLAB RS, Sectra, PASiS, 1177 direkt).
+// Nothing leaves the server: each step is just recorded with a timestamp so the UI can show a realistic status flow.
+const ref = p => `${p}-${Math.random().toString(36).slice(2, 8).toUpperCase()}`;
+const ROUTES = {
+  journal: () => ({ system: 'PMO', ref: ref('PMO'), steps: ['Journalanteckning förd till PMO', 'Signerad i PMO', 'Synlig i 1177 Journalen'] }),
+  fk: () => ({ system: 'Webcert', ref: ref('WC'), steps: ['Utkast skapat i Webcert via PMO (Intygsmodulen)', 'Signerat med SITHS-kort', 'FK 7804 skickat till Försäkringskassan', 'Mottaget av Försäkringskassan', 'AG 7804 skapat från FK 7804, utan diagnos', 'Intygen tillgängliga för patienten i 1177 Intyg'] }),
+  arb: () => ({ system: 'Webcert', ref: ref('WC'), steps: ['Utkast skapat i Webcert via PMO (Intygsmodulen)', 'Signerat med SITHS-kort', 'AG 1-14 tillgängligt för patienten i 1177 Intyg', 'Patienten kan skriva ut eller vidarebefordra till arbetsgivaren'] }),
+  recept: d => ({ system: 'PMO läkemedelsmodul', ref: ref('RX'), steps: ['Receptförslag inlagt i PMO läkemedelsmodul', 'Kontrollerat mot Nationella läkemedelslistan: inga interaktioner', `E-recept signerat med SITHS och skickat till E-hälsomyndigheten (${d.prescriptions.length} st)`, 'Tillgängligt för uttag på apotek'] }),
+  lab: d => ({ system: 'eLAB RS', ref: ref('LAB'), steps: [`Beställning skapad i eLAB RS (${d.tests.length} analyser)`, 'Signerad av beställande läkare', 'Etiketter klara för provtagning', 'Mottagen av Labmedicin Skåne'] }),
+  rtg: d => ({ system: 'Sectra (SOM)', ref: ref('BFM'), steps: [`Remiss skapad i Sectra: ${d.exam}`, 'Signerad och skickad', 'Mottagen av Bild- och funktionsmedicin', `Prioriterad: ${d.urgency}, patienten kallas`] }),
+  remiss: d => ({ system: 'PMO konsultremiss', ref: ref('REM'), steps: ['Konsultremiss skapad via PMO adressbok', `Signerad och skickad till ${d.to}`, 'Mottagen, under bedömning'] }),
+  uppfoljning: d => ({ system: 'PASiS', ref: ref('PAS'), steps: [`Bevakning skapad i PASiS (${d.actions.length} åtgärder)`, 'Tilldelad vårdadministratör', 'Patienten kontaktas för bokning'] }),
+  patientinfo: () => ({ system: '1177 direkt', ref: ref('1177'), steps: ['Meddelande skickat i läkarens namn via 1177 direkt', 'Avisering skickad till patienten (sms)', 'Läst av patienten'] }),
+};
+function dispatch(d, { system, ref, steps }) {
+  d.dispatch = { system, ref, started: new Date().toISOString(), steps: [], done: false };
+  const run = d.dispatch, delays = [300, 1200, 2500, 4000, 5500, 7000];
+  steps.forEach((label, i) => setTimeout(() => {
+    if (d.dispatch !== run) return;
+    run.steps.push({ label, at: new Date().toISOString() });
+    if (i === steps.length - 1) run.done = true;
+    changed();
+  }, delays[i] ?? 7000 + i * 1000));
+  run.total = steps.length; changed();
+}
+const AUTO_MIN_SCORE = +(process.env.AUTO_MIN_SCORE || 70); // relevance needed for a card to be drafted automatically
+const NEEDS = { journal: null, fk: null, arb: null, recept: null, lab: null, rtg: null, remiss: null, uppfoljning: null, patientinfo: null };
 
-export function createApi({ analyze, generateDoc, processTranscript }) {
+export function createApi({ analyze, generateDoc, processTranscript, rankCards }) {
+  async function runRank(r) {
+    if (r.relevance?.loading || !r.transcript.length) return;
+    r.relevance = { loading: true }; changed();
+    try { r.relevance = await rankCards({ transcript: plain(r.transcript) }); }
+    catch (e) { r.relevance = { error: e.message }; }
+    changed();
+    autoGenerate(r);
+  }
+  // "Invisible" flow: draft the journal and every clearly relevant card in the background, so they are ready
+  // when the doctor opens the conversation. The doctor still reviews and signs everything.
+  function autoGenerate(r) {
+    const kinds = ['journal', ...(r.relevance?.cards || []).filter(c => c.relevant && c.score >= AUTO_MIN_SCORE).map(c => c.kind)];
+    for (const k of new Set(kinds)) if (k in NEEDS && !r.docs[k]) runGenerate(r, k);
+  }
   async function runProcess(r) {
     try {
       // Soniox diarization gives each line a voice number; it helps Claude tell doctor from patient.
@@ -87,13 +128,13 @@ export function createApi({ analyze, generateDoc, processTranscript }) {
       r.title = p.title; r.summary = p.summary;
     } catch (e) { r.note = `Kunde inte bearbeta transkriptet: ${e.message}`; }
     r.processing = false; changed();
+    runRank(r);
   }
   async function runGenerate(r, kind) {
     r.docs[kind] = { loading: true }; changed();
     try {
       const args = { transcript: plain(r.transcript), lang: r.lang, journal: kind === 'journal' ? undefined : journalText(r) };
       const data = kind === 'fk' ? await analyze(args) : await generateDoc(kind, args);
-      if (kind === 'journal') { delete r.docs.fk; delete r.docs.arb; } // documents built on an old journal are stale
       r.docs[kind] = { data, createdAt: new Date().toISOString() };
     } catch (e) { r.docs[kind] = { error: e.message }; }
     changed();
@@ -185,6 +226,7 @@ export function createApi({ analyze, generateDoc, processTranscript }) {
       return json(res, 202, {}), true;
     }
     if (action === 'generate' && req.method === 'POST') {
+      if (r.docs[kind]?.dispatch) throw fail(409, 'Dokumentet är redan godkänt och överfört');
       if (!(kind in NEEDS)) throw fail(400, 'Okänd dokumenttyp');
       if (r.processing || !r.transcript.length) throw fail(409, 'Transkriptet är inte klart');
       if (NEEDS[kind] && !r.docs[NEEDS[kind]]?.data) throw fail(409, 'Skapa journalen först');
@@ -193,18 +235,33 @@ export function createApi({ analyze, generateDoc, processTranscript }) {
       return json(res, 202, {}), true;
     }
     if (action === 'journal' && req.method === 'PUT') { // edited by the doctor (e.g. in the Vim editor)
+      if (r.docs.journal?.dispatch) throw fail(409, 'Journalen är godkänd och överförd och kan inte ändras');
       const { data } = JSON.parse(await body(req));
-      r.docs.journal = { data, edited: new Date().toISOString() }; delete r.docs.fk; delete r.docs.arb; changed();
+      r.docs.journal = { data, edited: new Date().toISOString() }; changed();
       return json(res, 200, {}), true;
     }
-    if (action === 'sign' && req.method === 'POST') {
-      const d = r.docs[kind]; if (!d?.data) throw fail(409, 'Inget dokument att signera');
-      d.signed ??= new Date().toISOString(); r.signedAt ??= d.signed; changed();
-      return json(res, 200, {}), true;
+    if (action === 'doc' && req.method === 'PATCH') { // the doctor edits a field / adds or removes a list item
+      const d = r.docs[kind]; if (!d?.data) throw fail(404, 'Dokumentet finns inte');
+      if (d.dispatch) throw fail(409, 'Dokumentet är godkänt och överfört och kan inte ändras');
+      const { op = 'set', path, value } = JSON.parse(await body(req));
+      const keys = String(path || '').split('.'), last = keys.pop();
+      if (!last || [...keys, last].some(k => ['__proto__', 'constructor', 'prototype'].includes(k))) throw fail(400, 'Ogiltig sökväg');
+      const o = keys.reduce((x, k) => (x && typeof x === 'object' ? x[k] : undefined), d.data);
+      if (!o || typeof o !== 'object') throw fail(400, 'Ogiltig sökväg');
+      if (op === 'set') o[last] = typeof o[last] === 'number' ? Number(value) || 0 : String(value ?? '').slice(0, 4000);
+      else if (op === 'add' && Array.isArray(o[last])) o[last].push(value);
+      else if (op === 'remove' && Array.isArray(o)) o.splice(+last, 1);
+      else throw fail(400, 'Ogiltig ändring');
+      d.edited = new Date().toISOString();
+      if (kind === 'fk') d.data.checks = runChecks(d.data.cert, r.transcript, r.lang);
+      changed(); return json(res, 200, {}), true;
     }
-    if (action === 'webcert' && req.method === 'POST') { // DEMO: simulated hand-off, no real Webcert integration
-      const d = r.docs.fk; if (!d?.signed) throw fail(409, 'Signera intyget först');
-      if (!d.sent && !d.sending) { d.sending = true; changed(); setTimeout(() => { d.sending = false; d.sent = new Date().toISOString(); changed(); }, 1500); }
+    if (action === 'relevance' && req.method === 'POST') { r.relevance?.cards ? autoGenerate(r) : runRank(r); return json(res, 202, {}), true; } // ranked before: just fill in missing drafts
+    if (action === 'send' && req.method === 'POST') { // MOCK of the Region Skåne integration (see ROUTES)
+      const route = ROUTES[kind], d = r.docs[kind];
+      if (!route || !d?.data) throw fail(404, 'Inget dokument att skicka');
+      // One action: the doctor approves the draft and it is handed over; signing happens in the target system (a step in the flow).
+      if (!d.dispatch) { d.approved = new Date().toISOString(); r.signedAt ??= d.approved; dispatch(d, route(d.data)); }
       return json(res, 202, {}), true;
     }
     throw fail(405, 'Metoden stöds inte');

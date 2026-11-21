@@ -159,13 +159,30 @@ const DOCS = {
   journal: { schema: Journal, system: 'Du skriver ett utkast till journalanteckning för läkare i svensk primärvård utifrån ett transkriberat besök. Kort, sakligt journalspråk. ' + GROUNDING },
   arb: { schema: Arb, system: 'Du skriver ett utkast till läkarintyg om arbetsförmåga till arbetsgivare (sjuklöneperioden). Arbetsgivaren får INTE veta diagnos eller medicinska detaljer. Beskriv bara hur arbetsförmågan påverkas i relation till arbetet. ' + GROUNDING },
 };
+// Which after-work cards matter for this conversation (shown first; the rest go under "Visa fler").
+const CARD_KINDS = ['recept', 'lab', 'rtg', 'remiss', 'uppfoljning', 'patientinfo', 'arb', 'fk'];
+const Relevance = z.object({
+  cards: z.array(z.object({
+    kind: z.enum(CARD_KINDS),
+    relevant: z.boolean().describe('true only if the conversation clearly calls for this document'),
+    score: z.number().int().describe('0-100, how strongly the conversation calls for it'),
+    reason: z.string().describe('Very short Swedish reason citing what was said, max 8 words, e.g. "Läkaren förskrev Kåvepenin"'),
+  })).describe('Exactly one entry per kind'),
+});
+export async function rankCards({ transcript }) {
+  const { out } = await llm(Relevance,
+    `Du avgör vilka dokument en läkare i svensk primärvård behöver skapa efter ett besök. Typer: recept (läkemedel förskrevs), lab (prover beställdes), rtg (röntgen/MR/DT/ultraljud beställdes), remiss (remiss till annan vårdgivare, specialist, fysioterapeut, psykolog), uppfoljning (återbesök, telefonkontakt, bokningar), patientinfo (råd eller varningstecken gavs till patienten), arb (läkarintyg till arbetsgivaren för sjukskrivning dag 8-14), fk (sjukskrivning längre än 14 dagar: FK 7804 och AG 7804). Räkna sjukperioden från första sjukdagen som nämns i samtalet, inte från besöket. Sjukperiod upp till 7 dagar kräver inget intyg. Om perioden når dag 8-14 behövs arb. Om den passerar dag 14 behövs fk, och även arb om dag 8-14 ingår. Bedöm bara utifrån samtalet. ${GROUNDING}`,
+    `Transkript:\n${fmt(transcript)}`, { effort: 'low' });
+  return out;
+}
+
 export async function generateDoc(kind, { transcript, journal }) {
   const d = DOCS[kind];
   const { out } = await llm(d.schema, d.system, `Transkript:\n${fmt(transcript)}${withJournal(journal)}`);
   return out;
 }
 
-const api = createApi({ analyze, generateDoc, processTranscript });
+const api = createApi({ analyze, generateDoc, processTranscript, rankCards });
 const TYPES = { '.svg': 'image/svg+xml', '.webp': 'image/webp', '.png': 'image/png', '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
 if (!process.env.NO_SERVER) await init();
 if (!process.env.NO_SERVER) http.createServer(async (req, res) => {

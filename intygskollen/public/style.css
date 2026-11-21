@@ -212,3 +212,31 @@ table.rx td { padding: 6px; border-bottom: 1px solid var(--line); vertical-align
 ul.items { padding-left: 18px; margin: 0; } ul.items li { margin-bottom: 6px; }
 ul.todo { list-style: none; padding: 0; } ul.todo li { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; border-bottom: 1px solid var(--line); }
 ul.todo input { width: auto; margin-right: 6px; }
+.after-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin: 4px 0 8px; } .after-head h2 { margin: 0; }
+.after-head .mini-spin { vertical-align: -2px; margin-right: 4px; }
+.node .why { grid-column: 1 / -1; font-size: 11px; color: var(--brand); font-weight: 500; }
+.node.rel.ready { border-color: var(--brand2); box-shadow: inset 3px 0 var(--brand2); }
+details.more { margin-top: 10px; } details.more summary { cursor: pointer; font-size: 13px; color: var(--muted); font-weight: 500; padding: 6px 0; }
+details.more .after-grid { margin-top: 6px; opacity: .85; }
+.claim:empty::before { content: 'fyll i'; color: #b0b7c3; font-style: italic; }
+.claim:empty { display: inline-block; min-width: 40px; border-bottom: 1px dashed #d0d5dd; }
+.add { font: inherit; font-size: 12px; color: var(--brand); background: none; border: 1px dashed var(--line); border-radius: 6px; padding: 4px 10px; cursor: pointer; margin: 6px 0; }
+.add:hover { border-color: var(--brand2); }
+.rm { font: inherit; border: 0; background: none; color: #b0b7c3; cursor: pointer; font-size: 15px; line-height: 1; padding: 0 4px; }
+.rm:hover { color: var(--bad); }
+.dispatch { margin-top: 14px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: #fcfcfd; }
+.dispatch.done { border-color: var(--ok); background: var(--okbg); }
+.dispatch .dhd { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; } .dispatch .dhd .pill { margin-left: auto; }
+.dispatch .ref { font: 12px ui-monospace, monospace; color: var(--muted); }
+.steps { list-style: none; margin: 0 0 8px; padding: 0; }
+.steps li { display: flex; align-items: center; gap: 8px; font-size: 13px; padding: 4px 0; }
+.steps li.ok::before { content: ''; width: 16px; height: 16px; flex: none; border-radius: 50%; background: var(--ok) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='white' d='M9 16.2 4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z'/%3E%3C/svg%3E") center/12px no-repeat; }
+.steps li time { margin-left: auto; font: 11px ui-monospace, monospace; color: var(--muted); }
+.steps li.pending { color: var(--muted); }
+/* card states: grey (not started / draft) -> yellow (in progress) -> green (signed and every step done) */
+.node.draft, .node.ready, .node.loading, .node.static { background: var(--panel); border-color: var(--line); }
+.node.draft .na, .node.loading .na { color: var(--muted); }
+.node.mid { background: #fffbe6; border-color: #e0b800; } .node.mid .na { color: #8a6d00; }
+.node.complete { background: var(--okbg); border-color: var(--ok); } .node.complete .na { color: #027a48; }
+.node.rel.draft, .node.rel.ready { box-shadow: inset 3px 0 var(--brand2); }
+.side-col:has(.pill.ok) .add, .side-col:has(.pill.ok) .rm { display: none; }

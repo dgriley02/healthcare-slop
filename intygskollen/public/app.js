@@ -248,8 +248,8 @@ const FLOW = {
   remiss: { label: 'Remiss', desc: 'Till specialist eller rehab', needs: null, after: true },
   uppfoljning: { label: 'Uppföljning', desc: 'Åtgärder till vårdadministratören', needs: null, after: true },
   patientinfo: { label: 'Patientinfo', desc: 'Meddelande via 1177', needs: null, after: true },
-  arb: { label: 'Dag 8-14', desc: 'Sjuklöneperioden: AG 1-14 till arbetsgivaren', needs: 'journal' },
-  fk: { label: 'Från dag 15', desc: 'Sjukpenning: FK 7804 till Försäkringskassan och AG 7804 till arbetsgivaren', needs: 'journal' },
+  arb: { label: 'Intyg dag 8-14', desc: 'Sjuklöneperioden: AG 1-14 till arbetsgivaren', needs: null, after: true },
+  fk: { label: 'Intyg från dag 15', desc: 'Sjukpenning: FK 7804 och AG 7804', needs: null, after: true },
 };
 function renderDetail(r) {
   const u = uiOf(r);
@@ -285,6 +285,11 @@ function renderDetail(r) {
   if (keep.id === r.id) { if (keep.t != null) $('#transcript').scrollTop = keep.t; if (keep.s != null) $('.side-col').scrollTop = keep.s; }
   drawPlayer(r, playingId === r.id ? player.currentTime : 0); updatePlayer();
   if (u.open === 'journal' && u.vimEditing) mountVim(r);
+  $('details.more')?.addEventListener('toggle', e => { u.moreOpen = e.target.open; }); // keep open across live re-renders
+  if (u.open && r.docs[u.open]?.dispatch) $('.side-col').querySelectorAll('[contenteditable]').forEach(el => el.removeAttribute('contenteditable')); // approved = read-only
+  const side = $('.side-col');
+  side.addEventListener('focusout', e => { const el = e.target.closest?.('[data-path]'); if (!el) return; const v = el.textContent.trim(); if (v !== el.dataset.orig) { el.dataset.orig = v; editDoc(r, 'set', el.dataset.path, v); } });
+  side.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && e.target.closest?.('[data-path]')) { e.preventDefault(); e.target.blur(); } });
   $('#playbtn').onclick = () => { loadAudio(r); player.paused ? player.play() : player.pause(); };
   $('#pwave').onclick = e => { const b = e.target.getBoundingClientRect(); seek(r, (e.clientX - b.left) / b.width * r.duration); };
   $('#transcript').onclick = e => { const l = e.target.closest('.tline'); if (l?.dataset.t) seek(r, +l.dataset.t); };
@@ -299,12 +304,11 @@ function renderDetail(r) {
     }
     if (e.target.closest('[data-close]')) { u.open = null; return renderDetail(r); }
     if (e.target.closest('[data-regen]')) { const k = u.open; u.open = null; u.wantOpen = k; return act('POST', `generate/${k}`); }
+    const add = e.target.closest('[data-add]'), del = e.target.closest('[data-remove]');
+    if (add) { const p = add.dataset.add; return editDoc(r, 'add', p, ADD_TEMPLATES[p.split('.').pop()] ?? ''); }
+    if (del) return editDoc(r, 'remove', del.dataset.remove);
     if (e.target.closest('[data-vimedit]')) { u.vimEditing = true; return renderDetail(r); }
-    if (e.target.closest('[data-webcert]')) {
-      if (confirm('Skicka FK 7804 till Försäkringskassan via Webcert?\n\n(Demo: överföringen simuleras.)')) act('POST', 'webcert');
-      return;
-    }
-    if (e.target.closest('[data-sign]')) return act('POST', `sign/${u.open}`);
+    if (e.target.closest('[data-send]')) return act('POST', `send/${u.open}`);
     const el = e.target.closest('[data-ev]'); if (!el) return;
     document.querySelectorAll('.tline.hl').forEach(x => x.classList.remove('hl'));
     const ids = el.dataset.ev.split(',').filter(Boolean);
@@ -315,30 +319,40 @@ function renderDetail(r) {
 const canRun = (r, k) => !r.processing && r.transcript.length && (!FLOW[k].needs || r.docs[FLOW[k].needs]?.data);
 function retentionText(r) {
   if (r.example) return '';
-  if (r.audioDeleted) return `Ljudet raderades ${retentionDays} dagar efter signering. Texten finns kvar.`;
+  if (r.audioDeleted) return `Ljudet raderades ${retentionDays} dagar efter godkännande. Texten finns kvar.`;
   if (!r.audio) return '';
-  if (r.signedAt) return `Signerat ${fmtTime(r.signedAt)}. Ljudet raderas automatiskt ${fmtTime(Date.parse(r.signedAt) + retentionDays * 864e5)}.`;
-  return `Ljudet sparas tills ett dokument signerats och raderas ${retentionDays} dagar därefter.`;
+  if (r.signedAt) return `Godkänt ${fmtTime(r.signedAt)}. Ljudet raderas automatiskt ${fmtTime(Date.parse(r.signedAt) + retentionDays * 864e5)}.`;
+  return `Ljudet sparas tills ett dokument godkänts och raderas ${retentionDays} dagar därefter.`;
 }
 
 function flowHtml(r) {
+  const u = uiOf(r), R = r.relevance;
+  const missing = !R || (R.cards || []).some(c => c.relevant && c.score >= 70 && !r.docs[c.kind]) || !r.docs.journal;
+  if (missing && !R?.loading && !r.processing && r.transcript.length && !u.askedRank) { u.askedRank = true; api('POST', `/api/recordings/${r.id}/relevance`).catch(() => {}); }
+  const rel = Object.fromEntries((R?.cards || []).map(c => [c.kind, c]));
+  const kinds = Object.keys(FLOW).filter(k => FLOW[k].after);
+  // Relevant or already created first (by score); the rest behind "Visa fler".
+  const shown = R?.cards ? kinds.filter(k => rel[k]?.relevant || r.docs[k]).sort((a, b) => (rel[b]?.score ?? 0) - (rel[a]?.score ?? 0)) : kinds;
+  const hidden = kinds.filter(k => !shown.includes(k));
   const node = k => {
     const f = FLOW[k], d = r.docs[k] || {}, ok = canRun(r, k);
-    const state = d.loading ? 'loading' : d.data ? 'done' : d.error ? 'error' : ok ? 'ready' : 'locked';
-    const action = { loading: 'Skapar…', done: d.signed ? 'Signerad' : 'Öppna', error: 'Försök igen', ready: 'Skapa', locked: f.needs ? 'Skapa journal först' : 'Väntar på transkript' }[state];
-    return `<button class="node ${state}" data-node="${k}" ${state === 'locked' ? 'disabled' : ''}>
-      <span class="nl">${f.label}</span><span class="nd">${f.desc}</span><span class="na">${state === 'loading' ? '<i class="mini-spin"></i>' : ''}${action}</span>
+    // Grey until the doctor approves, yellow while the hand-off steps run, green when every step is done.
+    const x = d.dispatch;
+    const state = d.loading ? 'loading' : d.error ? 'error' : !d.data ? (ok ? 'ready' : 'locked') : x?.done ? 'complete' : x ? 'mid' : 'draft';
+    const action = { loading: 'Analyserar…', error: 'Försök igen', ready: 'Skapa', locked: 'Väntar på transkript', draft: 'Utkast klart, granska', complete: `Klar i ${SEND[k]?.[0]}`, mid: `Överförs till ${SEND[k]?.[0]}…` }[state];
+    const why = rel[k]?.relevant && !d.data ? `<span class="why">${esc(rel[k].reason)}</span>` : '';
+    return `<button class="node ${state} ${rel[k]?.relevant ? 'rel' : ''}" data-node="${k}" ${state === 'locked' ? 'disabled' : ''}>
+      <span class="nl">${f.label}</span><span class="nd">${f.desc}</span>${why}<span class="na">${state === 'loading' ? '<i class="mini-spin"></i>' : ''}${action}</span>
       ${d.error ? `<span class="ne">${esc(d.error)}</span>` : ''}</button>`;
   };
   return `<h2>Dokument</h2>
     <div class="tree">
-      <div class="node done static"><span class="nl">Transkript</span><span class="nd">${r.processing ? 'Bearbetas…' : `${r.transcript.length} repliker`}</span></div>
-      <div class="edge"></div>${node('journal')}
-      <div class="fork"><div>${node('arb')}</div><div>${node('fk')}</div></div>
+      <div class="node static"><span class="nl">Transkript</span><span class="nd">${r.processing ? 'Bearbetas…' : `${r.transcript.length} repliker`}</span></div>
+      <div class="edge"></div>${node('journal')}<div class="edge"></div>
     </div>
-    <h2 class="after-h">Efterarbete</h2>
-    <div class="after-grid">${Object.keys(FLOW).filter(k => FLOW[k].after).map(node).join('')}
-    </div>`;
+    <div class="after-head"><h2>Efterarbete</h2><span class="small muted">${R?.loading || (!R && r.transcript.length) ? '<i class="mini-spin"></i> Bedömer vad samtalet kräver…' : R?.cards ? 'Sorterat efter vad samtalet kräver' : ''}</span></div>
+    <div class="after-grid">${shown.map(node).join('') || '<p class="muted small">Samtalet verkar inte kräva något efterarbete.</p>'}</div>
+    ${hidden.length ? `<details class="more" ${u.moreOpen ? 'open' : ''}><summary>Visa fler (${hidden.length})</summary><div class="after-grid">${hidden.map(node).join('')}</div></details>` : ''}`;
 }
 function docPanel(r) {
   const u = uiOf(r), k = u.open, d = r.docs[k];
@@ -346,20 +360,30 @@ function docPanel(r) {
     <div id="vimHost" class="vimhost"><div class="spinner"></div></div>
     <div class="vimbar"><span id="vimMode">-- NORMAL --</span><span class="muted small">Källhänvisningar [U3] i slutet av raden behålls.</span></div>
     <div class="actions"><button class="btn" id="vimCancel">Avbryt</button> <button class="btn pri" id="vimSave">Spara</button></div>`;
-  return `<div class="dochead"><button class="btn sm" data-close>&larr; Flöde</button><span>${k === 'journal' && vimOn() ? '<button class="btn sm" data-vimedit>Redigera (Vim)</button> ' : ''}<button class="btn sm" data-regen>Skapa om</button></span></div>
+  const locked = !!d.dispatch;
+  return `<div class="dochead"><button class="btn sm" data-close>&larr; Flöde</button><span>${locked ? '<span class="pill ok">Godkänd, låst</span>' : `${k === 'journal' && vimOn() ? '<button class="btn sm" data-vimedit>Redigera (Vim)</button> ' : ''}<button class="btn sm" data-regen>Skapa om</button>`}</span></div>
     ${{ fk: fkHtml, journal: journalHtml, arb: arbHtml, ...AFTER_HTML }[k](d.data)}
-    ${k === 'fk' ? webcertHtml(d) : ''}
     ${k === 'arb' ? `<p class="small muted">${d.data.days > 14 ? '<b>Sjukskrivningen är längre än 14 dagar.</b> Skapa även underlaget för sjukpenning (från dag 15): FK 7804 och AG 7804.' : 'Varar sjukskrivningen längre än 14 dagar behövs även FK 7804 och AG 7804 (från dag 15).'}</p>` : ''}
-    <div class="actions">${k === 'fk' ? '<button class="btn" data-pdf="fk7804">FK 7804 · Försäkringskassan</button> <button class="btn" data-pdf="ag7804">AG 7804 · Arbetsgivaren</button> ' : ''}${k === 'arb' ? '<button class="btn" data-pdf="ag114">AG 1-14 · Arbetsgivaren</button> ' : ''}
-      <button class="btn pri" data-sign ${d.signed ? 'disabled' : ''}>${d.signed ? `Signerat ${fmtTime(d.signed)}` : 'Signera'}</button></div>`;
+    <div class="actions">${k === 'fk' ? '<button class="btn sm" data-pdf="fk7804">FK 7804 som PDF</button> <button class="btn sm" data-pdf="ag7804">AG 7804 som PDF</button> ' : ''}${k === 'arb' ? '<button class="btn sm" data-pdf="ag114">AG 1-14 som PDF</button> ' : ''}
+</div>
+    ${dispatchHtml(k, d)}`;
 }
 
-// Webcert: DEMO ONLY. Sending is simulated on the server; there is no real Webcert integration.
-function webcertHtml(d) {
-  if (d.sent) return `<div class="webcert sent"><b>Skickat till Försäkringskassan via Webcert</b><span>${fmtTime(d.sent)} · simulerat i demon, ingen riktig överföring</span></div>`;
-  if (d.sending) return '<div class="webcert"><i class="mini-spin"></i> Skickar via Webcert…</div>';
-  return `<div class="webcert"><button class="btn pri" data-webcert ${d.signed ? '' : 'disabled'}>Skicka via Webcert</button>
-    <span class="muted small">${d.signed ? 'Demo: simulerad överföring till Försäkringskassan.' : 'Signera intyget först.'}</span></div>`;
+// Hand-off to the Region Skåne systems (mocked on the server: a timed status flow, nothing is really sent).
+const SEND = { journal: ['PMO', 'Godkänn och för över till PMO'], fk: ['Webcert', 'Godkänn och för över till Webcert'], arb: ['Webcert', 'Godkänn och för över till Webcert'],
+  recept: ['PMO läkemedelsmodul', 'Godkänn och skicka e-recept'], lab: ['eLAB RS', 'Godkänn och beställ i eLAB RS'], rtg: ['Sectra', 'Godkänn och beställ i Sectra'],
+  remiss: ['PMO', 'Godkänn och skicka konsultremiss'], uppfoljning: ['PASiS', 'Godkänn och skapa bevakning i PASiS'], patientinfo: ['1177 direkt', 'Godkänn och skicka via 1177 direkt'] };
+function dispatchHtml(k, d) {
+  const [system, label] = SEND[k] || [];
+  if (!system) return '';
+  const x = d.dispatch;
+  const steps = x ? x.steps.map(s => `<li class="ok"><span>${esc(s.label)}</span><time>${new Date(s.at).toTimeString().slice(0, 8)}</time></li>`).join('')
+    + (x.done ? '' : '<li class="pending"><i class="mini-spin"></i><span>Väntar på svar…</span></li>') : '';
+  return `<div class="dispatch ${x?.done ? 'done' : ''}">
+    <div class="dhd"><b>${esc(system)}</b>${x ? `<span class="ref">${esc(x.ref)}</span>` : ''}<span class="pill grey">Demointegration</span></div>
+    ${x ? `<ol class="steps">${steps}</ol>` : ''}
+    ${x ? `<p class="small muted">Godkänd ${fmtTime(d.approved || x.started)}. Dokumentet är låst; signeringen sker i ${esc(system)}.</p>`
+      : `<button class="btn pri" data-send>${label}</button><p class="small muted">Granska utkastet ovan. Efter godkännande går det inte att ändra.</p>`}</div>`;
 }
 
 /* ---------- Vim editing of the journal (CodeMirror 5 + vim keymap, loaded on first use) ---------- */
@@ -399,38 +423,48 @@ async function mountVim(r) {
   $('#vimSave').onclick = save; $('#vimCancel').onclick = done;
 }
 
-/* ---------- after-work drafts (recept, remisser, uppföljning, patientinfo) ---------- */
-const ed = (text, ids = []) => `<span class="claim" data-ev="${ids.join(',')}" contenteditable>${esc(text) || '&nbsp;'}</span>${ids.length ? refs(ids) : ''}`;
-const blank = v => v ? esc(v) : '<em class="bad">Saknas</em>';
+/* ---------- editable documents ----------
+   Every editable field carries data-path (its place in the document data). Edits are saved to the server on blur,
+   so they survive re-renders and show up on every device; the FK checks are re-run on the server. */
+const refs = ids => ids?.length ? `<sup>${ids.join(' ')}</sup>` : '';
+const ed = (path, text, ids, level = 'ok') => `<span class="claim ${level}" data-path="${path}" data-orig="${esc(text)}" data-ev="${(ids || []).join(',')}" contenteditable>${esc(text)}</span>${refs(ids)} `;
+const claimSpan = (path, text, ids, level) => ed(path, text, ids, level) + (ids && !ids.length ? '<sup class="bad">ingen källa</sup>' : '');
+const addBtn = (path, label) => `<button class="add" data-add="${path}">+ ${label}</button>`;
+const rm = path => `<button class="rm" data-remove="${path}" title="Ta bort">&times;</button>`;
 const dl = rows => `<dl class="fk">${rows.filter(Boolean).map(([t, v]) => `<dt>${t}</dt><dd>${v}</dd>`).join('')}</dl>`;
 const urg = u => `<span class="pill ${u === 'rutin' ? '' : 'warn'}">${esc(u)}</span>`;
+const list = (path, items, label) => `<ul class="items">${items.map((x, i) => `<li>${ed(`${path}.${i}`, x)}${rm(`${path}.${i}`)}</li>`).join('')}</ul>${addBtn(path, label)}`;
+const ADD_TEMPLATES = {
+  prescriptions: { drug: '', form: '', strength: '', dosage: '', amount: '', duration: '', indication: '', evidence: [] },
+  tests: { name: '', reason: '', evidence: [] }, actions: { what: '', when: '', who: 'läkare', evidence: [] },
+  self_care: '', warning_signs: '', next_steps: '',
+};
 const AFTER_HTML = {
-  recept: d => `<h2>Receptutkast</h2>${d.prescriptions.length ? `<table class="rx"><tr><th>Läkemedel</th><th>Styrka</th><th>Dosering</th><th>Mängd</th><th>Tid</th></tr>
-    ${d.prescriptions.map(p => `<tr><td>${ed(`${p.drug} ${p.form}`.trim(), p.evidence)}<div class="small muted">${esc(p.indication)}</div></td><td>${ed(p.strength)}</td><td>${ed(p.dosage)}</td><td>${ed(p.amount)}</td><td>${ed(p.duration)}</td></tr>`).join('')}</table>`
-    : '<p class="muted">Inga läkemedel förskrevs i samtalet.</p>'}${d.warnings.map(w => `<div class="flag warn">${esc(w)}</div>`).join('')}`,
-  lab: d => `<h2>Labbremiss</h2>${dl([['Frågeställning', ed(d.question)], ['Brådska', urg(d.urgency)], ['Fasta', d.fasting ? 'Ja' : 'Nej']])}
-    <h3>Analyser</h3>${d.tests.length ? `<ul class="items">${d.tests.map(t => `<li><b>${ed(t.name, t.evidence)}</b> <span class="small muted">${esc(t.reason)}</span></li>`).join('')}</ul>` : '<p class="muted">Inga prover nämndes.</p>'}`,
-  rtg: d => `<h2>Röntgenremiss</h2>${dl([['Undersökning', ed(d.exam, d.evidence)], ['Frågeställning', ed(d.question)], ['Anamnes', ed(d.anamnesis)], ['Status', ed(d.status)], ['Brådska', urg(d.urgency)], ['Kontraindikationer', ed(d.contraindications)]])}`,
-  remiss: d => `<h2>Remiss</h2>${dl([['Till', ed(d.to, d.evidence)], ['Frågeställning', ed(d.question)], ['Anamnes', ed(d.anamnesis)], ['Status', ed(d.status)], ['Pågående behandling', ed(d.current_treatment)], ['Brådska', urg(d.urgency)]])}`,
-  uppfoljning: d => `<h2>Uppföljning</h2><p class="small muted">Åtgärdslista till vårdadministratören.</p>${d.actions.length ? `<ul class="items todo">${d.actions.map(a => `<li><label><input type="checkbox"> ${ed(a.what, a.evidence)}</label><span class="small muted">${esc(a.when)} · ${esc(a.who)}</span></li>`).join('')}</ul>` : '<p class="muted">Ingen uppföljning bestämdes.</p>'}`,
-  patientinfo: d => `<h2>Till patienten via 1177</h2><p class="patient">${ed(d.summary)}</p>
-    ${[['Egenvård', d.self_care], ['Sök vård igen om', d.warning_signs], ['Nästa steg', d.next_steps]].filter(([, l]) => l.length).map(([h, l]) => `<h3>${h}</h3><ul class="items">${l.map(x => `<li>${ed(x)}</li>`).join('')}</ul>`).join('')}
-    <p class="small muted">Skicka via 1177 är inte inkopplat i demon.</p>`,
+  recept: d => `<h2>Receptutkast</h2>${d.prescriptions.length ? `<table class="rx"><tr><th>Läkemedel</th><th>Styrka</th><th>Dosering</th><th>Mängd</th><th>Tid</th><th></th></tr>
+    ${d.prescriptions.map((p, i) => `<tr><td>${ed(`prescriptions.${i}.drug`, p.drug, p.evidence)} ${ed(`prescriptions.${i}.form`, p.form)}<div class="small muted">${ed(`prescriptions.${i}.indication`, p.indication)}</div></td>
+      <td>${ed(`prescriptions.${i}.strength`, p.strength)}</td><td>${ed(`prescriptions.${i}.dosage`, p.dosage)}</td><td>${ed(`prescriptions.${i}.amount`, p.amount)}</td><td>${ed(`prescriptions.${i}.duration`, p.duration)}</td><td>${rm(`prescriptions.${i}`)}</td></tr>`).join('')}</table>`
+    : '<p class="muted">Inga läkemedel förskrevs i samtalet.</p>'}${addBtn('prescriptions', 'Läkemedel')}${d.warnings.map(w => `<div class="flag warn">${esc(w)}</div>`).join('')}`,
+  lab: d => `<h2>Labbremiss</h2>${dl([['Frågeställning', ed('question', d.question)], ['Brådska', urg(d.urgency)], ['Fasta', d.fasting ? 'Ja' : 'Nej']])}
+    <h3>Analyser</h3><ul class="items">${d.tests.map((t, i) => `<li><b>${ed(`tests.${i}.name`, t.name, t.evidence)}</b> <span class="small muted">${ed(`tests.${i}.reason`, t.reason)}</span>${rm(`tests.${i}`)}</li>`).join('')}</ul>${addBtn('tests', 'Analys')}`,
+  rtg: d => `<h2>Röntgenremiss</h2>${dl([['Undersökning', ed('exam', d.exam, d.evidence)], ['Frågeställning', ed('question', d.question)], ['Anamnes', ed('anamnesis', d.anamnesis)], ['Status', ed('status', d.status)], ['Brådska', urg(d.urgency)], ['Kontraindikationer', ed('contraindications', d.contraindications)]])}`,
+  remiss: d => `<h2>Remiss</h2>${dl([['Till', ed('to', d.to, d.evidence)], ['Frågeställning', ed('question', d.question)], ['Anamnes', ed('anamnesis', d.anamnesis)], ['Status', ed('status', d.status)], ['Pågående behandling', ed('current_treatment', d.current_treatment)], ['Brådska', urg(d.urgency)]])}`,
+  uppfoljning: d => `<h2>Uppföljning</h2><p class="small muted">Åtgärdslista till vårdadministratören.</p><ul class="items todo">${d.actions.map((a, i) => `<li><div><input type="checkbox"> ${ed(`actions.${i}.what`, a.what, a.evidence)}${rm(`actions.${i}`)}</div>
+      <span class="small muted">${ed(`actions.${i}.when`, a.when)} · ${ed(`actions.${i}.who`, a.who)}</span></li>`).join('')}</ul>${addBtn('actions', 'Åtgärd')}`,
+  patientinfo: d => `<h2>Till patienten via 1177</h2><p class="patient">${ed('summary', d.summary)}</p>
+    <h3>Egenvård</h3>${list('self_care', d.self_care, 'Råd')}<h3>Sök vård igen om</h3>${list('warning_signs', d.warning_signs, 'Varningstecken')}<h3>Nästa steg</h3>${list('next_steps', d.next_steps, 'Steg')}
+`,
 };
 
-/* ---------- documents ---------- */
-const refs = ids => ids.length ? `<sup>${ids.join(' ')}</sup>` : '<sup class="bad">ingen källa</sup>';
-const claimSpan = (text, ids, level = 'ok') => `<span class="claim ${level}" data-ev="${ids.join(',')}" contenteditable>${esc(text)}</span>${refs(ids)} `;
-const journalHtml = j => `<h2>Journalanteckning</h2>${j.sections.map(sec => `<h3>${esc(sec.heading)}</h3><p>${sec.claims.map(c => claimSpan(c.text, c.evidence)).join('')}</p>`).join('')}`;
+const journalHtml = j => `<h2>Journalanteckning</h2>${j.sections.map((sec, i) => `<h3>${ed(`sections.${i}.heading`, sec.heading)}</h3><p>${sec.claims.map((c, k) => claimSpan(`sections.${i}.claims.${k}.text`, c.text, c.evidence)).join('')}</p>`).join('')}`;
 const arbHtml = a => `<p class="eyebrow">Sjuklöneperioden · dag 8-14</p><h2>Läkarintyg om arbetsförmåga</h2>
   <p class="small muted">Blankett AG 1-14 till arbetsgivaren. Dag 1-7 räcker patientens egen sjukanmälan; från dag 8 kan arbetsgivaren kräva läkarintyg. Innehåller ingen diagnos: arbetsgivaren har inte rätt till medicinska uppgifter.</p>
-  <dl class="fk"><dt>Arbetsförmåga</dt><dd>${a.work_capacity_reduced ? `Nedsatt med ${a.degree} % i ${a.days} dagar` : 'Inte nedsatt'}</dd>
-  ${a.occupation ? `<dt>Sysselsättning</dt><dd>${esc(a.occupation)}</dd>` : ''}
-  <dt>Hur den påverkas</dt><dd data-arb="description">${a.description.map(c => claimSpan(c.text, c.evidence)).join('') || '<em class="bad">Saknas</em>'}</dd>
-  <dt>Arbetsförmåga trots sjukdom</dt><dd data-arb="adjustments">${a.adjustments.map(c => claimSpan(c.text, c.evidence)).join('') || '<span class="muted">Inga diskuterade</span>'}</dd></dl>`;
+  <dl class="fk"><dt>Arbetsförmåga</dt><dd>${a.work_capacity_reduced ? `Nedsatt med ${ed('degree', a.degree)} % i ${ed('days', a.days)} dagar` : 'Inte nedsatt'}</dd>
+  <dt>Sysselsättning</dt><dd>${ed('occupation', a.occupation || '')}</dd>
+  <dt>Hur den påverkas</dt><dd data-arb="description">${a.description.map((c, i) => claimSpan(`description.${i}.text`, c.text, c.evidence)).join('') || '<em class="bad">Saknas</em>'}</dd>
+  <dt>Arbetsförmåga trots sjukdom</dt><dd data-arb="adjustments">${a.adjustments.map((c, i) => claimSpan(`adjustments.${i}.text`, c.text, c.evidence)).join('') || '<span class="muted">Inga diskuterade</span>'}</dd></dl>`;
 
 function fkHtml({ cert: c, checks: k }) {
-  const claims = sec => c[sec].length ? c[sec].map((x, i) => claimSpan(x.text, x.evidence, k.support[`${sec}.${i}`]?.level)).join('') : '<em class="bad">Saknas</em>';
+  const claims = sec => c[sec].length ? c[sec].map((x, i) => claimSpan(`cert.${sec}.${i}.text`, x.text, x.evidence, k.support[`${sec}.${i}`]?.level)).join('') : '<em class="bad">Saknas</em>';
   const flags = f => k.flags.filter(x => x.field === f).map(x => `<div class="flag ${x.severity}">${esc(x.text)}</div>`).join('');
   const color = k.score >= 80 ? 'ok' : k.score >= 50 ? 'warn' : 'bad';
   const DFA = { diagnosis: 'D · Diagnos', function_impairment: 'F · Funktion', activity_limitation: 'A · Aktivitet', chain: 'Kedjan' };
@@ -438,19 +472,36 @@ function fkHtml({ cert: c, checks: k }) {
     <p class="eyebrow">Sjukpenning · från dag 15</p><div class="fkhead"><div><h2>Läkarintyg för sjukpenning</h2><p class="small muted">Samma bedömning fyller två blanketter: FK 7804 till Försäkringskassan och AG 7804 till arbetsgivaren (utan diagnos).</p></div><div class="score ${color}">${k.score}<small>/100</small></div></div>
     <div class="dfa-row">${Object.entries(DFA).map(([key, l]) => `<div class="dfa ${c.dfa[key].status}" title="${esc(c.dfa[key].reason)}">${l}</div>`).join('')}</div>
     <dl class="fk">
-      <dt>Diagnos</dt><dd data-field="diagnosis">${claimSpan(`${c.diagnosis.icd10} ${c.diagnosis.text}`, c.diagnosis.evidence)}</dd>
-      <dt>Sysselsättning</dt><dd data-field="occupation">${c.occupation.text ? claimSpan(c.occupation.text, c.occupation.evidence) : '<em class="bad">Saknas</em>'}${flags('occupation')}</dd>
+      <dt>Diagnos</dt><dd data-field="diagnosis">${ed('cert.diagnosis.icd10', c.diagnosis.icd10)}${ed('cert.diagnosis.text', c.diagnosis.text, c.diagnosis.evidence)}</dd>
+      <dt>Sysselsättning</dt><dd data-field="occupation">${ed('cert.occupation.text', c.occupation.text, c.occupation.evidence)}${flags('occupation')}</dd>
       <dt>Funktionsnedsättning</dt><dd data-field="function_impairment">${claims('function_impairment')}${flags('function_impairment')}</dd>
       <dt>Aktivitetsbegränsning</dt><dd data-field="activity_limitation">${claims('activity_limitation')}${flags('activity_limitation')}</dd>
       <dt>Åtgärder</dt><dd data-field="treatment">${claims('treatment')}</dd>
-      <dt>Prognos</dt><dd data-field="prognosis"><span contenteditable>${esc(prognosisText(c.prognosis))}</span></dd>
-      <dt>Åtgärder för återgång</dt><dd data-field="work_measures"><span contenteditable>${esc(c.work_measures)}</span></dd>
-      <dt>Sjukskrivning</dt><dd>${claimSpan(`${c.sick_leave.degree} % i ${c.sick_leave.days} dagar`, c.sick_leave.evidence)}
+      <dt>Prognos</dt><dd data-field="prognosis">${esc(prognosisText(c.prognosis))}</dd>
+      <dt>Åtgärder för återgång</dt><dd data-field="work_measures">${ed('cert.work_measures', c.work_measures)}</dd>
+      <dt>Sjukskrivning</dt><dd>${ed('cert.sick_leave.degree', c.sick_leave.degree)} % i ${ed('cert.sick_leave.days', c.sick_leave.days, c.sick_leave.evidence)} dagar
         ${k.duration ? `<div class="small muted">Rekommenderat: ${k.duration.recommended} dagar (demovärden)</div>` : ''}${flags('sick_leave')}</dd>
+      ${c.motivation_longer_leave || k.flags.some(f => f.field === 'sick_leave') ? `<dt>Motivering längre sjukskrivning</dt><dd>${ed('cert.motivation_longer_leave', c.motivation_longer_leave)}</dd>` : ''}
     </dl>
     ${c.questions_to_ask.length ? `<h3>Fråga innan patienten går</h3><ol>${c.questions_to_ask.map(q => `<li>${esc(q)}</li>`).join('')}</ol>` : ''}
-    <h3>Till patienten</h3><p class="patient">${esc(c.patient_summary)}</p>`;
+    <h3>Till patienten</h3><p class="patient">${ed('cert.patient_summary', c.patient_summary)}</p>`;
 }
+
+// Save an edit / add or remove a list item. Applied locally first so the page doesn't flicker back.
+function setLocal(obj, path, op, value) {
+  const keys = path.split('.'), last = keys.pop(), o = keys.reduce((x, k) => x?.[k], obj); if (!o) return;
+  if (op === 'set') o[last] = typeof o[last] === 'number' ? Number(value) || 0 : value;
+  if (op === 'add') o[last].push(structuredClone(value));
+  if (op === 'remove') o.splice(+last, 1);
+}
+function editDoc(r, op, path, value) {
+  const k = uiOf(r).open, d = r.docs[k]; if (!d?.data) return;
+  if (d.dispatch) return;
+  setLocal(d.data, path, op, value);
+  api('PATCH', `/api/recordings/${r.id}/doc/${k}`, { op, path, value }).catch(e => alert(`Kunde inte spara: ${e.message}`));
+  if (op !== 'set') renderDetail(r);
+}
+
 const PROGNOSIS = {
   full_after_end: () => 'Patienten förväntas kunna återgå helt i nuvarande sysselsättning efter detta intygs slutdatum.',
   full_after_months: p => `Patienten förväntas kunna återgå helt i nuvarande sysselsättning efter ${p.months} månad(er).`,
@@ -517,7 +568,7 @@ async function renderSettings() {
     <div class="card srow"><div><b>Claude API</b><div class="muted small">Nyckeln läses från <code>.env</code> på servern och skickas aldrig till webbläsaren.</div></div><span id="apiStatus" class="pill">Kontrollerar…</span></div>
     <div class="card srow"><div><b>Synk</b><div class="muted small">Inspelningar, ljud och dokument sparas på servern och uppdateras live på alla inloggade enheter.</div></div><span class="pill ${online ? 'ok' : 'bad'}">${online ? 'Ansluten' : 'Offline'}</span></div>
     <div class="card srow"><div><b>Taligenkänning</b><div class="muted small">Soniox transkriberar inspelningen på servern: tider och säkerhet per ord, talarseparering och flera språk i samma samtal. Fungerar i alla webbläsare. Webbläsarens taligenkänning används för livetexten${hasSR ? '' : ' (stöds inte här)'} och som reserv.</div></div><span class="pill" id="sttStatus">Kontrollerar…</span></div>
-    <div class="card srow"><div><b>Ljudlagring</b><div class="muted small">Ljudet sparas så att läkaren kan lyssna om transkriptet ser fel ut, och raderas automatiskt ${retentionDays} dagar efter signering. Bara texten sparas långsiktigt.</div></div><span class="pill">Signering + ${retentionDays} dagar</span></div>
+    <div class="card srow"><div><b>Ljudlagring</b><div class="muted small">Ljudet sparas så att läkaren kan lyssna om transkriptet ser fel ut, och raderas automatiskt ${retentionDays} dagar efter att läkaren godkänt ett dokument. Bara texten sparas långsiktigt.</div></div><span class="pill">Godkännande + ${retentionDays} dagar</span></div>
     <div class="card srow"><div><b>Vim-läge</b><div class="muted small">Redigera journalanteckningar med Vim-kommandon (i, Esc, dd, :w, :q). Sparas på den här enheten.</div></div>
       <label class="switch"><input type="checkbox" id="vimToggle" ${vimOn() ? 'checked' : ''}><span></span></label></div>
     <div class="card srow"><div><b>Datahantering</b><div class="muted small">Servern loggar inga transkript. Rensa raderar allt på servern för alla enheter.</div></div><button class="btn" id="clearAll">Rensa alla inspelningar</button></div></div>`;
