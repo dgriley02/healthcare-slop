@@ -240,3 +240,65 @@ details.more .after-grid { margin-top: 6px; opacity: .85; }
 .node.complete { background: var(--okbg); border-color: var(--ok); } .node.complete .na { color: #027a48; }
 .node.rel.draft, .node.rel.ready { box-shadow: inset 3px 0 var(--brand2); }
 .side-col:has(.pill.ok) .add, .side-col:has(.pill.ok) .rm { display: none; }
+/* our own evidence markers (dotted), distinct from browser spell-check squiggles (which are turned off) */
+.claim.weak { text-decoration: underline dotted var(--warn) 2px; text-underline-offset: 3px; }
+.claim.none { text-decoration: underline dotted var(--bad) 2px; text-underline-offset: 3px; }
+
+/* ---------- patients, patient page, meeting ---------- */
+.search { font-size: 16px; padding: 12px 14px; border-radius: 10px; margin: 4px 0 6px; }
+.plist, .mlist { list-style: none; margin: 0; padding: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+.plist li, .mlist li { border-bottom: 1px solid var(--line); display: flex; align-items: center; } .plist li:last-child, .mlist li:last-child { border-bottom: 0; }
+.plist a, .mlist a { flex: 1; display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 12px 16px; color: inherit; text-decoration: none; }
+.plist a:hover, .mlist a:hover { background: var(--soft); }
+.plist .m, .mlist .m { grid-column: 1; font-size: 12px; color: var(--muted); }
+.plist .last { grid-row: 1 / span 2; grid-column: 2; align-self: center; font-size: 12px; color: var(--muted); text-align: right; }
+.mlist .t { font-weight: 500; } .plist li.muted, .mlist li.muted { padding: 14px 16px; }
+.phead { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; flex-wrap: wrap; } .phead > div { flex: 1; min-width: 0; }
+.btn.big { display: inline-flex; align-items: center; gap: 8px; padding: 12px 18px; font-size: 15px; border-radius: 10px; } .btn.big svg { width: 20px; height: 20px; }
+.page h2 { margin: 14px 0 6px; }
+.banner { display: block; background: #fffbe6; border: 1px solid #e0b800; color: #5c4a00; border-radius: 10px; padding: 10px 14px; text-decoration: none; font-size: 14px; }
+.meeting { display: flex; flex-direction: column; min-height: 100%; } .meeting .stage { flex: 1; }
+.recbtn.remote { background: #98a2b3; box-shadow: none; animation: none; cursor: default; } .recbtn.remote::after { content: ''; }
+.dhead a { color: inherit; }
+@media (max-width: 820px) {
+  .rail .brand { display: block; width: 34px; margin: 0; padding: 0; border: 0; }
+  .rail { justify-content: space-between; padding: 6px 16px; } .rail > div[style] { display: none; }
+  .phead .btn.big { width: 100%; justify-content: center; }
+}
+/* live text: fixed-height box, new words fade in, older lines fade out at the top */
+.live { height: 4.6em; overflow: hidden; line-height: 1.5; max-width: 720px; width: 100%; text-align: center;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.6em); mask-image: linear-gradient(to bottom, transparent 0, #000 1.6em); }
+.live .win { animation: wordIn .45s ease-out both; }
+@keyframes wordIn { from { opacity: 0; filter: blur(3px); } to { opacity: 1; filter: none; } }
+.live .dots { display: inline-flex; gap: 3px; vertical-align: middle; margin-left: 2px; }
+.live .dots i { width: 4px; height: 4px; border-radius: 50%; background: var(--muted); animation: dot 1.2s infinite ease-in-out; }
+.live .dots i:nth-child(2) { animation-delay: .15s; } .live .dots i:nth-child(3) { animation-delay: .3s; }
+@keyframes dot { 0%, 80%, 100% { opacity: .2; } 40% { opacity: .9; } }
+/* sliding window: exactly 3 fixed rows, left-aligned (centred lines would shift sideways as words arrive), smooth scroll up */
+.live { --row: 1.5em; line-height: var(--row); height: calc(3 * var(--row)); text-align: left; scroll-behavior: smooth;
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 calc(0.9 * var(--row))); mask-image: linear-gradient(to bottom, transparent 0, #000 calc(0.9 * var(--row))); }
+/* live text: no fade at the top (the leading edge of the text fades in instead), no dots */
+.live { -webkit-mask-image: none; mask-image: none; color: var(--text); }
+.live .dots { display: none; }
+/* speaker roles */
+.tline { grid-template-columns: 48px 1fr auto; }
+.tline .spk { font: inherit; font-size: 12px; font-weight: 600; background: none; border: 0; padding: 1px 0 0; text-align: left; cursor: pointer; display: flex; flex-direction: column; line-height: 1.2; color: var(--muted); }
+.tline .spk small { font-weight: 400; font-size: 10px; color: var(--muted); }
+.tline .spk:hover { text-decoration: underline; }
+.spk.sn { color: #0e7490; } .spk.sa { color: #b45309; } .spk.st { color: #4d7c0f; } .spk.so { color: #475467; }
+.tline { position: relative; } .spkmenu { left: 0; top: 24px; }
+.tline .spk.sl { color: var(--brand); } .tline .spk.sp { color: #6941c6; } .tline .spk.sn { color: #0e7490; } .tline .spk.sa { color: #b45309; } .tline .spk.st { color: #4d7c0f; }
+.tline .spk.sx { color: #98a2b3; font-style: italic; } .trow h2 { display: flex; align-items: center; gap: 8px; }
+/* speaker roles as tinted chips, one clearly distinct hue per role */
+.tline .spk { align-self: start; padding: 1px 6px; border-radius: 6px; font-size: 11px; line-height: 1.35; width: fit-content; max-width: 46px; }
+.tline .spk small { color: inherit; opacity: .8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 40px; }
+.tline .spk.sl { color: #b42318; background: #fee4e2; }   /* läkare: röd */
+.tline .spk.sp { color: #5925dc; background: #ebe9fe; }   /* patient: lila */
+.tline .spk.sa { color: #b93815; background: #ffead5; }   /* anhörig: orange */
+.tline .spk.sn { color: #0e7090; background: #e0f2fe; }   /* sjuksköterska: blå */
+.tline .spk.st { color: #3b7c0f; background: #e3fbcc; }   /* tolk: grön */
+.tline .spk.so { color: #475467; background: #eaecf0; }   /* annan vårdpersonal: grå */
+.tline .spk.sx { color: #98a2b3; background: #f9fafb; font-style: italic; } /* övrig */
+.tline .spk:not([class*=" s"]) { color: #667085; background: #f2f4f7; } /* okänd */
+.tline .spk:hover { text-decoration: none; filter: brightness(.95); }
+.tline .spk.sa { color: #93370d; background: #fef7c3; box-shadow: inset 0 0 0 1px #fde272; } /* anhörig: gul, tydligt skild från läkarens röda */

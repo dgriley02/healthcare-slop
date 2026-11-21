@@ -143,3 +143,151 @@ Object.assign(window.SAMPLES, {
     L('Läkare', 'Come back or call 1177 if you get more short of breath, chest pain or if the fever is still there after three days on antibiotics. We will check CRP again in two weeks.'),
   ],
 });
+
+// Mixed-language consultations: the doctor speaks Swedish, the patient their own language (as transcribed by Soniox).
+// National minority languages (finska, meänkieli, samiska, romani chib, jiddisch) and the largest immigrant languages.
+// Written for the demo; texts in some languages should be checked by a native speaker before being shown publicly.
+const P = text => L('Patient', text), D = text => L('Läkare', text);
+window.SAMPLE_LANGS = Object.assign(window.SAMPLE_LANGS || {}, {
+  'Arabiska: urinvägsinfektion': 'sv+ar', 'Persiska: migrän': 'sv+fa', 'Somaliska: astma': 'sv+so', 'Tigrinja: magsmärta': 'sv+ti',
+  'Kurdiska: ryggskott, dag 8-14': 'sv+ckb', 'BKS: högt blodtryck': 'sv+bs', 'Polska: handskada, röntgen + FK': 'sv+pl', 'Turkiska: yrsel': 'sv+tr',
+  'Ukrainska: sömnproblem efter trauma': 'sv+uk', 'Finska: knäartros': 'sv+fi', 'Meänkieli: diabeteskontroll': 'sv+fit', 'Nordsamiska: eksem': 'sv+se',
+  'Romani: akut bronkit': 'sv+rom', 'Jiddisch: fall och höftsmärta': 'sv+yi',
+});
+Object.assign(window.SUMMARIES, {
+  'Arabiska: urinvägsinfektion': 'Sveda vid vattenkastning sedan två dagar, ingen feber. Urinsticka positiv för nitrit. Pivmecillinam 400 mg x 3 i 3 dagar.',
+  'Persiska: migrän': 'Återkommande ensidig huvudvärk med ljuskänslighet. Migrän. Sumatriptan 50 mg vid anfall, huvudvärksdagbok, återbesök om 2 månader.',
+  'Somaliska: astma': 'Hosta och pip i bröstet nattetid, värre vid kyla. Misstänkt astma. Spirometri med reversibilitet, Bricanyl Turbuhaler vid behov.',
+  'Tigrinja: magsmärta': 'Brännande smärta i övre buken i en månad. Helicobacter-test i avföring, blodstatus. Omeprazol 20 mg i 4 veckor.',
+  'Kurdiska: ryggskott, dag 8-14': 'Ryggskott för en vecka sedan, lagerarbetare. Nedsatt rörlighet, negativ Lasègue. Sjukskriven 100 % i en vecka till, fysioterapeut.',
+  'BKS: högt blodtryck': 'Blodtryck 162/98 vid upprepade mätningar. Labb: kreatinin, elektrolyter, lipider, HbA1c. Amlodipin 5 mg. Sköterskekontroll om 4 veckor.',
+  'Polska: handskada, röntgen + FK': 'Byggarbetare som klämde höger hand. Svullnad över femte mellanhandsbenet. Röntgen hand. Sjukskriven 100 % i tre veckor.',
+  'Turkiska: yrsel': 'Yrsel vid uppresning i två veckor. Ortostatiskt blodtrycksfall. Labb: blodstatus, elektrolyter, B12. Pausa hydroklortiazid.',
+  'Ukrainska: sömnproblem efter trauma': 'Mardrömmar och sömnsvårigheter sedan flykten. Misstänkt PTSD. Remiss psykolog för traumafokuserad KBT, melatonin 2 mg.',
+  'Finska: knäartros': 'Smärta i båda knäna vid gång, morgonstelhet under 30 minuter. Knäartros. Remiss fysioterapeut till artrosskola, paracetamol.',
+  'Meänkieli: diabeteskontroll': 'Typ 2-diabetes, HbA1c 58. Fortsatt metformin. Labb inför nästa kontroll, fotundersökning hos sköterska.',
+  'Nordsamiska: eksem': 'Kliande eksem i armvecken sedan vintern. Betametason kräm i två veckor, mjukgörande kräm dagligen.',
+  'Romani: akut bronkit': 'Hosta i tio dagar efter förkylning, ingen feber, normala lungor. Akut bronkit, ingen antibiotika. Egenvårdsråd och varningstecken.',
+  'Jiddisch: fall och höftsmärta': '82-årig kvinna som föll hemma, smärta i vänster höft, kan gå med stöd. Röntgen höft, paracetamol, remiss till fysioterapeut för fallprevention.',
+});
+Object.assign(window.SAMPLES, {
+  'Arabiska: urinvägsinfektion': [
+    D('Hej, vad gäller det idag?'), P('عندي حرقة عند التبول منذ يومين، وأحتاج للذهاب إلى الحمام كثيراً.'),
+    D('Har du feber eller ont i ryggen?'), P('لا، ليس عندي حرارة ولا ألم في الظهر.'),
+    D('Urinstickan visar nitrit och vita blodkroppar. Det är en okomplicerad urinvägsinfektion.'),
+    D('Du får pivmecillinam, Selexid, 400 milligram tre gånger om dagen i tre dagar.'),
+    P('هل يمكنني الذهاب إلى العمل؟'), D('Ja, du kan arbeta. Hör av dig om du får feber eller ont i ryggen.'),
+  ],
+  'Persiska: migrän': [
+    D('Hej, berätta om huvudvärken.'), P('چند ماه است که هر هفته سردرد شدید یک‌طرفه دارم و نور اذیتم می‌کند.'),
+    D('Mår du illa när det kommer?'), P('بله، حالت تهوع دارم و باید در اتاق تاریک دراز بکشم.'),
+    D('Det låter som migrän. Neurologstatus är normalt.'),
+    D('Du får sumatriptan 50 milligram, ta en tablett tidigt i anfallet, högst två per dygn.'),
+    D('För huvudvärksdagbok så ses vi på återbesök om två månader.'), P('باشه، ممنون.'),
+  ],
+  'Somaliska: astma': [
+    D('Hej, vad kan jag hjälpa dig med?'), P('Waxaan qabaa qufac iyo xiiq laabta ah habeenkii, gaar ahaan marka uu qabow yahay.'),
+    D('Hur länge har du haft det?'), P('Ilaa saddex bilood. Marmarka neefta ayaa i dhegta.'),
+    D('Jag hör lite pip på lungorna. Det kan vara astma.'),
+    D('Jag skriver en remiss till spirometri med reversibilitetstest här på vårdcentralen.'),
+    D('Du får Bricanyl Turbuhaler 0,5 milligram, en inhalation vid behov, högst sex per dygn.'),
+    D('Sök vård direkt om du får svår andnöd som inte går över med medicinen.'),
+  ],
+  'Tigrinja: magsmärta': [
+    D('Hej, berätta om magen.'), P('ኣብ ላዕለዋይ ክፋል ከብደይ ንሓደ ወርሒ ዝኸውን ዝሓርር ቃንዛ ኣለኒ።'),
+    D('Är det värre när du är hungrig eller efter mat?'), P('ምስ ጠመኹ ይብርትዕ፣ ድሕሪ ምብላዕ ቁሩብ ይሓይሽ።'),
+    D('Har du kräkts blod eller haft svart avföring?'), P('ኣይፋል፣ ከምኡ የለን።'),
+    D('Jag skickar en labbremiss: Helicobacter pylori-antigen i avföring och blodstatus.'),
+    D('Du får omeprazol 20 milligram en gång dagligen i fyra veckor. Jag ringer dig med provsvaren.'),
+  ],
+  'Kurdiska: ryggskott, dag 8-14': [
+    D('Hej, hur är det med ryggen?'), P('هەفتەیەک لەمەوبەر لە کاتی هەڵگرتنی سندوقێک پشتم ئازاری گرت.'),
+    D('Vad jobbar du med?'), P('لە کۆگا کار دەکەم و هەموو ڕۆژێک سندوقی قورس هەڵدەگرم.'),
+    D('Framåtböjningen är nedsatt till 40 grader, Lasègue är negativ och neurologin är normal.'),
+    D('Det är ett ryggskott. Du kan inte lyfta tungt än. Jag sjukskriver dig på heltid i en vecka till, så du har varit sjuk i två veckor totalt.'),
+    D('Jag remitterar dig till fysioterapeut. Ta ibuprofen 400 milligram vid behov.'),
+  ],
+  'BKS: högt blodtryck': [
+    D('Hej, sköterskan har mätt ditt blodtryck flera gånger.'), P('Da, rekli su mi da je pritisak visok. Ponekad me boli glava.'),
+    D('Det är 162 över 98, även idag. Röker du?'), P('Ne, prestao sam prije pet godina.'),
+    D('Jag skriver en labbremiss: kreatinin, natrium, kalium, lipidstatus och HbA1c, fastande.'),
+    D('Du börjar med amlodipin 5 milligram en gång om dagen.'),
+    D('Sköterskan kontrollerar blodtrycket om fyra veckor. Det kan bli lite svullet runt fotlederna.'),
+  ],
+  'Polska: handskada, röntgen + FK': [
+    D('Hej, vad har hänt med handen?'), P('Przytrzasnąłem prawą rękę na budowie wczoraj. Jest spuchnięta i bardzo boli.'),
+    D('Vad jobbar du med?'), P('Jestem robotnikiem budowlanym, noszę ciężkie rzeczy i używam narzędzi cały dzień.'),
+    D('Det är svullnad och ömhet över femte mellanhandsbenet och nedsatt greppkraft.'),
+    D('Jag skriver en röntgenremiss för höger hand, frågeställning fraktur i femte metakarpalbenet.'),
+    D('Du kan inte greppa verktyg eller bära. Jag sjukskriver dig på heltid i tre veckor.'),
+    D('Ta paracetamol 1 gram upp till tre gånger om dagen. Om röntgen visar fraktur remitterar vi till handkirurgen.'),
+  ],
+  'Turkiska: yrsel': [
+    D('Hej, berätta om yrseln.'), P('İki haftadır ayağa kalktığımda başım dönüyor, bir kere neredeyse düşüyordum.'),
+    D('Vilka mediciner tar du?'), P('Tansiyon için hidroklorotiyazid kullanıyorum.'),
+    D('Blodtrycket är 132 liggande och 104 stående. Det är ett blodtrycksfall när du reser dig.'),
+    D('Pausa hydroklortiazid. Jag skickar en labbremiss: blodstatus, natrium, kalium, kreatinin och B12.'),
+    D('Res dig långsamt och drick ordentligt. Vi ses om två veckor.'),
+  ],
+  'Ukrainska: sömnproblem efter trauma': [
+    D('Hej, hur sover du?'), P('Дуже погано. Мені сняться кошмари про війну, я прокидаюся кілька разів за ніч.'),
+    D('Hur länge har det varit så?'), P('З того часу, як ми втекли, вже близько року.'),
+    D('Har du tankar på att skada dig själv?'), P('Ні, таких думок немає.'),
+    D('Det låter som posttraumatiskt stressyndrom. Jag skickar en remiss till psykolog för traumafokuserad KBT.'),
+    D('Du kan ta melatonin 2 milligram en timme före sänggåendet. Vi ses om fyra veckor.'),
+  ],
+  'Finska: knäartros': [
+    D('Hej, hur är det med knäna?'), P('Molempia polvia särkee kävellessä, varsinkin portaissa. Aamulla ne ovat jäykät noin puoli tuntia.'),
+    D('Jag undersöker. Det knastrar i båda knäna och böjningen är lätt nedsatt.'),
+    D('Det är knäartros. Den bästa behandlingen är träning, så jag skickar en remiss till fysioterapeut för artrosskola.'),
+    P('Saanko jotain kipuun?'), D('Ta paracetamol 1 gram upp till tre gånger om dagen vid behov.'),
+  ],
+  'Meänkieli: diabeteskontroll': [
+    D('Hej, välkommen på diabeteskontrollen.'), P('Hyvin mie olen pärjänny, mutta joskus mie unhotan ottaa tapletit.'),
+    D('Ditt HbA1c är 58, det är nästan på målet. Fortsätt med metformin 1 gram två gånger om dagen.'),
+    D('Jag skickar en labbremiss inför nästa kontroll: HbA1c, lipidstatus, kreatinin och urin-albumin.'),
+    D('Sköterskan gör en fotundersökning om tre månader.'), P('Kiitos, se oon hyvä.'),
+  ],
+  'Nordsamiska: eksem': [
+    D('Hej, vad gäller det?'), P('Mus lea sáhpánas ihtti gieđaid luovttain dálvvi rájes, ja dat gáskkiha olu.'),
+    D('Det är ett torrt, rodnat eksem i armvecken.'),
+    D('Du får betametason kräm, Betnovat, en gång om dagen i två veckor, sedan varannan dag i en vecka.'),
+    D('Smörj mjukgörande kräm, Canoderm, dagligen även när det är bra.'), P('Giitu.'),
+  ],
+  'Romani: akut bronkit': [
+    D('Hej, berätta om hostan.'), P('Kerdem kaśaj deś dives, palo e but šudrimos. Naj man tato.'),
+    D('Lungorna låter normalt och syremättnaden är 98 procent.'),
+    D('Det är en akut bronkit. Antibiotika hjälper inte, hostan kan sitta i några veckor.'),
+    D('Drick varmt och vila. Sök vård igen om du får feber, andnöd eller hostar blod.'),
+  ],
+  'Jiddisch: fall och höftsmärta': [
+    D('Hej, vad har hänt?'), P('איך בין געפֿאַלן אין דער היים נעכטן, און מײַן לינקע היפֿט טוט מיר וויי.'),
+    D('Kan du gå?'), P('יאָ, אָבער נאָר מיט מײַן שטעקן.'),
+    D('Det är ömhet över vänster höft men inget förkortat ben. Jag skriver en röntgenremiss för vänster höft.'),
+    D('Ta paracetamol 1 gram tre gånger om dagen. Jag remitterar dig också till fysioterapeut för fallförebyggande träning.'),
+  ],
+});
+
+// Several speakers: doctor, patient, a relative and a nurse (for testing speaker roles).
+Object.assign(window.SUMMARIES, {
+  'Efter stroke, med fru och sköterska': 'Uppföljning sex veckor efter lindrig stroke. Frun beskriver trötthet och glömska, sköterskan har mätt blodtryck 148/88. Atorvastatin höjs, remiss arbetsterapeut, sjukskriven 50 % i fyra veckor.',
+});
+Object.assign(window.SAMPLES, {
+  'Efter stroke, med fru och sköterska': [
+    L('Läkare', 'Hej Lars, och välkommen. Är det din fru som följer med idag?'),
+    L('Anhörig', 'Ja, jag är hans fru. Jag ville följa med för han glömmer ofta vad som sägs.'),
+    L('Läkare', 'Bra att du är med. Sköterskan har tagit några värden före besöket.'),
+    L('Sjuksköterska', 'Blodtrycket var 148 över 88 i sittande, pulsen 72 och regelbunden. Han väger 84 kilo.'),
+    L('Läkare', 'Tack. Lars, hur känns det sedan strokeen för sex veckor sedan?'),
+    L('Patient', 'Det är okej, men jag blir så trött. Efter två timmar på jobbet orkar jag inte mer.'),
+    L('Anhörig', 'Han har också svårt att komma ihåg saker. Han har glömt sina tabletter flera gånger och tappar tråden när vi pratar.'),
+    L('Läkare', 'Vad jobbar du med, Lars?'),
+    L('Patient', 'Jag är ekonomiassistent. Jag sitter vid datorn och stämmer av fakturor hela dagarna.'),
+    L('Läkare', 'Kraften i armar och ben är normal och talet är klart. Du klarar MoCA-testet med 24 poäng, lite nedsatt uppmärksamhet och minne.'),
+    L('Läkare', 'Vi höjer atorvastatin till 80 milligram en gång om dagen, och blodtrycket behöver ner. Sköterskan följer upp blodtrycket om två veckor.'),
+    L('Läkare', 'Jag skickar en remiss till arbetsterapeut för bedömning av kognition och anpassning i arbetet.'),
+    L('Läkare', 'Du klarar inte heltid med den här tröttheten. Jag sjukskriver dig på 50 procent i fyra veckor.'),
+    L('Sjuksköterska', 'Jag kan ge er en dosett och ringa om två veckor för blodtryckskontrollen.'),
+    L('Anhörig', 'Det vore jättebra, tack.'),
+  ],
+});

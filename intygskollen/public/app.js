@@ -25,17 +25,16 @@ const LANGS = { 'sv-SE': 'Svenska', 'en-US': 'Engelska (USA)', 'en-GB': 'Engelsk
   'bs-BA': 'Bosniska', 'sr-RS': 'Serbiska', 'fi-FI': 'Finska', 'da-DK': 'Danska', 'nb-NO': 'Norska', 'de-DE': 'Tyska', 'fr-FR': 'Franska',
   'es-ES': 'Spanska', 'it-IT': 'Italienska', 'pt-PT': 'Portugisiska', 'zh-CN': 'Kinesiska', 'th-TH': 'Thailändska', 'vi-VN': 'Vietnamesiska' };
 const LANGNAME = Object.fromEntries(Object.entries(LANGS).map(([c, n]) => [c.slice(0, 2), n.replace(/ \(.*\)/, '')]));
+Object.assign(LANGNAME, { ckb: 'Kurdiska (sorani)', fit: 'Meänkieli', se: 'Nordsamiska', rom: 'Romani chib', yi: 'Jiddisch', bs: 'Bosniska/kroatiska/serbiska', ti: 'Tigrinja', so: 'Somaliska', en: 'Engelska' });
 const recLang = () => 'sv-SE'; // Soniox detects the language(s) itself; the browser preview listens for Swedish
 
-/* ---------- server state ---------- */
-const PATIENTS = [ // synthetic demo patients
-  { id: 'P1', name: 'Erik Lund', age: 34 }, { id: 'P2', name: 'Sara Holm', age: 41 }, { id: 'P3', name: 'Amira Haddad', age: 52 },
-  { id: 'P4', name: 'Jonas Berg', age: 27 }, { id: 'P5', name: 'Birgitta Ek', age: 63 }, { id: 'P6', name: 'Ali Karimi', age: 38 },
-  { id: 'P7', name: 'Maja Lind', age: 31 }, { id: 'P8', name: 'Fatima Noor', age: 45 }, { id: 'P9', name: 'Karin Sjö', age: 49 }, { id: 'P10', name: 'Daniel Moore', age: 36 },
-];
-let recordings = [], retentionDays = 7, online = true;
+/* ---------- server state & live sync ---------- */
+let recordings = [], patients = [], session = null, retentionDays = 7, online = true, sonioxLive = false;
+// Per tab (sessionStorage): two tabs on one computer are two devices, and a reload keeps the id so a running recording stays ours.
+const DEVICE = (() => { try { return sessionStorage.getItem('ik.device') || (sessionStorage.setItem('ik.device', Math.random().toString(36).slice(2, 10)), sessionStorage.getItem('ik.device')); } catch { return Math.random().toString(36).slice(2, 10); } })();
 const ui = {}; // per-recording view state that is local to this device: { open, vimEditing, wantOpen }
 const uiOf = r => (ui[r.id] ??= {});
+const patientOf = id => patients.find(p => p.id === id);
 async function api(method, url, body, type = 'application/json') {
   const res = await fetch(url, { method, headers: body ? { 'content-type': type } : {}, body: type === 'application/json' && body ? JSON.stringify(body) : body });
   const data = await res.json().catch(() => ({}));
@@ -44,8 +43,11 @@ async function api(method, url, body, type = 'application/json') {
 }
 async function load() {
   try {
-    const d = await api('GET', '/api/recordings');
-    recordings = d.recordings; retentionDays = d.retentionDays; online = true;
+    const d = await api('GET', '/api/state');
+    recordings = d.recordings; patients = d.patients; retentionDays = d.retentionDays; online = true; sonioxLive = !!d.sonioxLive;
+    const prev = session; session = d.session; followSession(prev);
+    if (session.state !== 'recording' || session.recorder === DEVICE) ra = null; // the live stream belongs to one recording only
+    if (prev && session.version !== prev.version) resetLive();
     for (const r of recordings) { // open a document automatically once the generation this device asked for is done
       const u = uiOf(r);
       if (u.wantOpen && r.docs[u.wantOpen]?.data) { u.open = u.wantOpen; u.wantOpen = null; }
@@ -54,117 +56,311 @@ async function load() {
   } catch { online = false; }
   render();
 }
-// Live sync: re-render on every server change, but never while the user is typing or editing.
+// The shared meeting drives navigation on every device: a new meeting opens the recorder everywhere,
+// and when the recording is saved everyone moves on to the transcript.
+function followSession(prev) {
+  const s = session, active = ['ready', 'recording', 'uploading'].includes(s.state);
+  if (!prev) { if (active && !location.hash.startsWith('#/r/')) location.hash = '#/mote'; return; }
+  if (s.version !== prev.version && s.state === 'ready') location.hash = '#/mote';
+  if (s.meetingId && s.meetingId !== prev.meetingId && location.hash === '#/mote') location.hash = `#/r/${s.meetingId}`;
+}
+// Re-render on every change, but never while the user is typing or editing.
 let dirty = false;
-const busy = () => { const a = document.activeElement; return a && (a.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName)) || Object.values(ui).some(u => u.vimEditing); };
+const busy = () => { const a = document.activeElement; return a && (a.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName) && a.id !== 'q') || Object.values(ui).some(u => u.vimEditing); };
 function render() { if (busy()) { dirty = true; return; } dirty = false; route(); }
 document.addEventListener('focusout', () => setTimeout(() => dirty && render(), 0));
-new EventSource('/api/events').onmessage = () => load();
-// Fallback: some tunnels/proxies buffer SSE, so also poll (cheap: one small JSON request).
+// WebSocket for instant sync and the live view of a recording made on another device; polling as fallback.
+let ws = null;
+async function connectWs() {
+  try {
+    const { token } = await api('GET', '/api/ws-token');
+    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?token=${token}`);
+    ws.onmessage = e => { const m = JSON.parse(e.data); if (m.type === 'change') load(); if (m.type === 'live') onRemoteLive(m); };
+    ws.onclose = () => { ws = null; setTimeout(connectWs, 2000); };
+  } catch { setTimeout(connectWs, 3000); }
+}
+connectWs();
 let lastPoll = '';
 setInterval(async () => {
-  try { const t = await (await fetch('/api/recordings')).text(); if (t !== lastPoll) { const first = !lastPoll; lastPoll = t; if (!first) load(); } } catch {}
+  try { const t = await (await fetch('/api/state')).text(); if (t !== lastPoll) { const first = !lastPoll; lastPoll = t; if (!first) load(); } } catch {}
 }, 4000);
 
 /* ---------- router ---------- */
 const find = id => recordings.find(x => x.id === id);
 function route() {
-  const h = location.hash, m = h.match(/^#\/r\/(R\d+)/), r = m && find(m[1]);
-  const section = h.startsWith('#/patienter') ? 'patienter' : h.startsWith('#/installningar') ? 'installningar' : 'inspelning';
-  document.querySelectorAll('.rail a[data-nav]').forEach(a => a.classList.toggle('on', a.dataset.nav === section));
+  const h = location.hash, m = h.match(/^#\/r\/(R\d+)/), r = m && find(m[1]), pm = h.match(/^#\/p\/(P\d+)/), p = pm && patientOf(pm[1]);
+  document.querySelectorAll('.rail a[data-nav]').forEach(a => a.classList.toggle('on', h.startsWith('#/installningar')));
   if (!r) player.pause();
   if (r) renderDetail(r);
-  else if (section === 'patienter') renderPatients();
-  else if (section === 'installningar') renderSettings();
-  else if (rec) refreshList(); // keep the live recorder intact while recording
-  else renderRecord();
+  else if (h.startsWith('#/installningar')) renderSettings();
+  else if (h.startsWith('#/mote')) renderMeeting();
+  else if (p) renderPatient(p);
+  else renderPatients();
 }
 window.addEventListener('hashchange', () => { dirty = false; route(); });
 const onDetail = r => location.hash === `#/r/${r.id}`;
 
-/* ---------- recording view ---------- */
-let rec = null, openMenu = null;
-function listHtml() {
-  if (!online && !recordings.length) return '<li class="muted small">Kan inte nå servern.</li>';
-  return recordings.slice().reverse().map(r => `
-    <li><a href="#/r/${r.id}"><b>${r.id}</b><span class="t">${esc(r.title)}</span>
-      <span class="m">${r.processing ? '<span class="pill warn">Bearbetar…</span>' : `${fmtTime(r.createdAt)} · ${fmtDur(r.duration)}${r.audio ? ' · ljud' : ''}`}</span></a>
-      <div class="menu-wrap"><button class="icon more" data-menu="${r.id}" aria-label="Fler val">${ICON.more}</button>
-        ${openMenu === r.id ? `<div class="menu"><a href="#/r/${r.id}">Öppna</a><button data-rename="${r.id}">Byt namn</button><button data-del="${r.id}" class="bad">Ta bort</button></div>` : ''}</div></li>`).join('');
+/* ---------- patients: search, then the patient's meetings ---------- */
+let query = '', openMenu = null;
+const norm = s => String(s).toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[\s-]/g, '');
+const meetingsOf = id => recordings.filter(r => r.patient === id).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+function patientRows() {
+  const q = norm(query), list = patients.filter(p => !q || norm(p.name).includes(q) || norm(p.personnummer).includes(q));
+  if (!online && !patients.length) return '<li class="muted small">Kan inte nå servern.</li>';
+  return list.map(p => { const m = meetingsOf(p.id);
+    return `<li><a href="#/p/${p.id}"><b>${esc(p.name)}</b><span class="m">${esc(p.personnummer)} · ${p.age} år</span>
+      <span class="last">${m.length ? `${m.length} möte${m.length > 1 ? 'n' : ''} · senast ${fmtTime(m[0].createdAt)}` : 'Inga möten'}</span></a></li>`; }).join('')
+    || '<li class="muted small">Ingen patient matchar sökningen.</li>';
 }
-function refreshList() { const l = $('#list'); if (l) l.innerHTML = listHtml(); }
-function renderRecord() {
-  $('#view').innerHTML = `
-    <div class="rec-layout">
-      <section class="stage">
-        <div class="wave-wrap"><canvas id="wave"></canvas></div>
-        <div class="timer" id="timer">${rec ? fmtDur((Date.now() - rec.start) / 1000) : '0:00'}</div>
-        <button class="recbtn ${rec ? 'on' : ''}" id="recbtn" aria-label="Starta/stoppa inspelning">${rec ? ICON.stop : ICON.mic}</button>
-        <p class="live" id="live"></p>
-        <p class="hint" id="hint">${rec ? 'Spelar in. Tryck för att stoppa.' : 'Tryck för att börja spela in samtalet'}</p>
-
-      </section>
-      <aside class="list"><h2>Inspelningar</h2><ul id="list">${listHtml()}</ul>
-        <p class="privacy">Synkas mellan dina enheter. Demo: använd bara rollspelade samtal, ingen riktig patientdata.</p></aside>
-    </div>`;
-  $('#recbtn').onclick = () => (rec ? stopRecording() : startRecording());
-  $('#list').onclick = async e => {
+function activeBanner() {
+  const s = session; if (!s || !['ready', 'recording', 'uploading'].includes(s.state)) return '';
+  const p = patientOf(s.patientId);
+  return `<a class="banner" href="#/mote"><b>${s.state === 'recording' ? 'Inspelning pågår' : 'Pågående möte'}</b> med ${esc(p?.name)} · gå till mötet &rarr;</a>`;
+}
+function renderPatients() {
+  $('#view').innerHTML = `<div class="page">${activeBanner()}<h1>Patienter</h1>
+    <input id="q" class="search" type="search" placeholder="Sök på namn eller personnummer" value="${esc(query)}" autocomplete="off">
+    <ul class="plist" id="plist">${patientRows()}</ul>
+    <p class="privacy">Demo: syntetiska patienter och demo-personnummer (TF). Ingen riktig patientdata.</p></div>`;
+  const q = $('#q'); q.oninput = () => { query = q.value; $('#plist').innerHTML = patientRows(); };
+  if (!matchMedia('(pointer: coarse)').matches) q.focus();
+}
+function renderPatient(p) {
+  const list = meetingsOf(p.id), s = session, busyRec = s && ['recording', 'uploading'].includes(s.state);
+  $('#view').innerHTML = `<div class="page">${activeBanner()}
+    <div class="phead"><a href="#/" class="icon back" aria-label="Till patientlistan">${ICON.back}</a>
+      <div><h1>${esc(p.name)}</h1><span class="muted">${esc(p.personnummer)} · ${p.age} år</span></div>
+      <button class="btn pri big" id="newMeeting" ${busyRec ? 'disabled title="En inspelning pågår"' : ''}>${ICON.mic} Nytt möte</button></div>
+    <h2>Möten</h2>
+    <ul class="mlist" id="mlist">${list.map(r => `<li><a href="#/r/${r.id}"><span class="t">${esc(r.title)}</span>
+      <span class="m">${fmtTime(r.createdAt)} · ${fmtDur(r.duration)}${r.processing ? ' · <span class="pill warn">Bearbetar…</span>' : ''} · ${docSummary(r)}</span></a>
+      <div class="menu-wrap"><button class="icon more" data-menu="${r.id}" aria-label="Fler val">${ICON.more}</button>
+        ${openMenu === r.id ? `<div class="menu"><a href="#/r/${r.id}">Öppna</a><button data-rename="${r.id}">Byt namn</button><button data-del="${r.id}" class="bad">Ta bort</button></div>` : ''}</div></li>`).join('')
+      || '<li class="muted small">Inga tidigare möten.</li>'}</ul></div>`;
+  $('#newMeeting').onclick = () => newMeeting(p.id);
+  $('#mlist').onclick = async e => {
     const t = e.target.closest('[data-menu],[data-del],[data-rename]'); if (!t) return;
     const { menu, del, rename } = t.dataset;
-    if (menu) { openMenu = openMenu === menu ? null : menu; return refreshList(); }
+    if (menu) { openMenu = openMenu === menu ? null : menu; return renderPatient(p); }
     openMenu = null;
-    if (del && confirm(`Ta bort ${del}? Ljud, transkript och dokument raderas på alla enheter.`)) await api('DELETE', `/api/recordings/${del}`).catch(err => alert(err.message));
+    if (del && confirm('Ta bort mötet? Ljud, transkript och dokument raderas på alla enheter.')) await api('DELETE', `/api/recordings/${del}`).catch(err => alert(err.message));
     if (rename) { const n = prompt('Nytt namn', find(rename)?.title); if (n?.trim()) await api('PATCH', `/api/recordings/${rename}`, { title: n.trim() }).catch(err => alert(err.message)); }
-    refreshList();
+    renderPatient(p);
   };
-  drawLive(rec?.bars || []);
 }
-document.addEventListener('click', e => { if (openMenu && !e.target.closest('.menu-wrap')) { openMenu = null; refreshList(); } });
+const docSummary = r => { const d = Object.values(r.docs), done = d.filter(x => x.dispatch?.done).length; return d.length ? `${done}/${d.length} dokument klara` : 'inga dokument'; };
+document.addEventListener('click', e => { if (openMenu && !e.target.closest('.menu-wrap')) { openMenu = null; route(); } });
+async function newMeeting(patientId) {
+  try { await api('POST', '/api/session', { action: 'new', patientId }); } catch (e) { return alert(e.message); }
+  location.hash = '#/mote'; load();
+}
+
+/* ---------- meeting: one shared recorder, only one device records ---------- */
+let rec = null;
+function renderMeeting() {
+  const s = session || { state: 'idle' }, p = patientOf(s.patientId);
+  if (!p || s.state === 'idle' || s.state === 'done') {
+    $('#view').innerHTML = `<div class="page"><h1>Inget pågående möte</h1><p class="muted">Välj en patient och tryck på Nytt möte.</p><a class="btn pri" href="#/">Till patientlistan</a></div>`;
+    return;
+  }
+  const mine = !!rec, other = s.state === 'recording' && s.recorder !== DEVICE;
+  const hint = mine ? 'Spelar in. Tryck för att stoppa.' : other ? 'Inspelningen görs på en annan enhet och visas här live.'
+    : s.state === 'uploading' ? 'Sparar och transkriberar…' : 'Tryck för att börja spela in samtalet';
+  $('#view').innerHTML = `<div class="meeting">
+    <header class="dhead"><a href="#/p/${p.id}" class="icon back" aria-label="Till patienten">${ICON.back}</a>
+      <div><h1>Nytt möte · ${esc(p.name)}</h1><span class="muted small">${esc(p.personnummer)} · ${p.age} år</span></div>
+      ${!mine && !other && s.state === 'ready' ? '<button class="btn sm" id="cancelMeeting">Avbryt möte</button>' : ''}</header>
+    <section class="stage">
+      <div class="wave-wrap"><canvas id="wave"></canvas></div>
+      <div class="timer" id="timer">${mine ? fmtDur((Date.now() - rec.start) / 1000) : other && ra ? fmtDur(ra.pos / SR_STREAM) : '0:00'}</div>
+      ${s.state === 'uploading' && !mine ? '<div class="spinner"></div>'
+        : `<button class="recbtn ${mine || other ? 'on' : ''} ${other ? 'remote' : ''}" id="recbtn" ${other ? 'disabled' : ''} aria-label="Starta/stoppa inspelning">${mine ? ICON.stop : ICON.mic}</button>`}
+      <p class="live" id="live">${!sonioxLive && other && ra ? esc(ra.text) : ''}</p>
+      <p class="hint" id="hint">${hint}</p>
+    </section></div>`;
+  if (sonioxLive) renderLiveInto($('#live'));
+  $('#recbtn') && ($('#recbtn').onclick = () => (rec ? stopRecording() : startRecording()));
+  $('#cancelMeeting') && ($('#cancelMeeting').onclick = async () => { await api('POST', '/api/session', { action: 'cancel', device: DEVICE }).catch(e => alert(e.message)); location.hash = `#/p/${p.id}`; });
+  const st = mine ? rec.local : other ? ra : null;
+  drawLive(st && st.pos != null ? st.bars.slice(Math.max(0, Math.floor(st.pos / SPB) - 400), Math.floor(st.pos / SPB)) : mine ? rec.bars : []);
+}
+/* ---------- live audio stream (separate binary WebSocket channel) ----------
+   The recording device streams 16 kHz mono PCM; the server replicates it to the other devices and tells everyone one shared
+   display delay (syncDelay). Receivers compute the waveform from the audio itself and play it out at real-time speed, syncDelay
+   behind; the recorder delays its own waveform by the same amount, so both screens show the same thing at the same moment. */
+const SR_STREAM = 16000, SPB = SR_STREAM * BAR_MS / 1000; // samples per waveform bar
+let audioWs = null, syncDelay = 0, ra = null; // ra = audio received from the recording device
+async function connectAudio() {
+  try {
+    const { token } = await api('GET', '/api/ws-token');
+    audioWs = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/audio?token=${token}`);
+    audioWs.binaryType = 'arraybuffer';
+    audioWs.onopen = () => audioWs.send(JSON.stringify({ type: 'hello', device: DEVICE }));
+    audioWs.onmessage = e => {
+      if (typeof e.data !== 'string') return onAudioFrame(e.data);
+      const m = JSON.parse(e.data);
+      if (m.type === 'ping') audioWs.send(JSON.stringify({ type: 'pong', t: m.t }));
+      if (m.type === 'delay') syncDelay = m.ms;
+    };
+    audioWs.onclose = () => { audioWs = null; setTimeout(connectAudio, 2000); };
+  } catch { setTimeout(connectAudio, 3000); }
+}
+connectAudio();
+// One stream model for both the receivers and the recording device itself: PCM frames (indexed by sample) are turned into
+// waveform bars, and a play-out loop renders them at real-time speed, `playDelay()` behind the newest audio.
+const playDelay = () => Math.max(syncDelay, 100); // at least ~2 frames, so the play-out never runs dry between frames
+const newStream = idx => ({ bars: [], acc: 0, n: 0, level: 0, next: idx, pos: null, text: '' });
+function feed(st, idx, pcm) { // pcm: Int16Array starting at sample idx
+  const push = s2 => { st.acc += s2; if (++st.n === SPB) { // same smoothing everywhere, so all screens draw the same waveform
+    st.level = st.level * 0.45 + Math.min(1, Math.sqrt(st.acc / SPB) * 4) * 0.55; st.bars.push(st.level); st.acc = 0; st.n = 0; } };
+  for (let i = st.next; i < idx; i++) push(0); // gap (lost frames): silence
+  for (const v of pcm) push((v / 32768) ** 2);
+  st.next = idx + pcm.length;
+  st.pos ??= Math.max(0, st.next - playDelay() * SR_STREAM / 1000);
+}
+function playOut(st, alive) { // render loop; `alive()` says when to stop
+  let last = performance.now();
+  const frame = now => {
+    if (!alive()) return;
+    const dt = Math.min(100, now - last); last = now;
+    if (st.pos != null) {
+      const target = st.next - playDelay() * SR_STREAM / 1000, lag = (target - st.pos) / SPB; // in bars
+      st.pos = Math.min(st.next, Math.max(0, st.pos + dt * SR_STREAM / 1000 * (1 + Math.max(-0.5, Math.min(0.5, lag / 20)))));
+      const b = st.pos / SPB, n = Math.floor(b);
+      if (location.hash === '#/mote') drawLive(st.bars.slice(Math.max(0, n - 400), n), b - n);
+    }
+    requestAnimationFrame(frame);
+  };
+  requestAnimationFrame(frame);
+}
+function onAudioFrame(buf) {
+  if (rec) return;
+  const idx = new DataView(buf).getUint32(0, true), pcm = new Int16Array(buf, 4);
+  if (!ra || idx + SR_STREAM * 3 < ra.next) ra = newStream(idx); // new recording
+  if (idx < ra.next) return; // duplicate / late frame
+  feed(ra, idx, pcm);
+  if (location.hash === '#/mote' && session?.state === 'recording' && (!$('#wave') || !$('#recbtn.remote'))) renderMeeting();
+  if (!ra.loop) {
+    const st = ra; st.loop = true;
+    playOut(st, () => ra === st && !rec);
+    const tick = setInterval(() => { // time follows the audio, in sync with the recording device
+      if (ra !== st) return clearInterval(tick);
+      const t = $('#timer'); if (t && location.hash === '#/mote' && st.pos != null) t.textContent = fmtDur(st.pos / SR_STREAM);
+    }, 200);
+  }
+}
+/* Live text view, written out like a chat model's answer: only final (never-changing) words are committed; the committed text
+   is revealed character by character at a steady, smoothly adapting pace, with a soft fade at the leading edge.
+   The box keeps 3 fixed rows and scrolls older rows away. */
+let lv = null;
+const LV_TAIL = 10; // characters in the fading leading edge
+const newLive = () => ({ buf: '', used: 0, text: '', shown: 0, rate: 18, settle: 1, loop: false });
+const resetLive = () => { lv = newLive(); const l = $('#live'); if (l) l.innerHTML = ''; };
+function liveAdd(add, partial) {
+  lv ??= newLive();
+  lv.buf += add || '';
+  let rest = lv.buf.slice(lv.used);
+  const continues = partial && !/^\s/.test(partial) && !/[\s.,!?;:]$/.test(rest); // the last final word may continue in the partial
+  if (continues) rest = rest.slice(0, rest.search(/\S*$/));
+  const words = rest.split(/\s+/).filter(Boolean);
+  if (words.length) { lv.text += (lv.text ? ' ' : '') + words.join(' '); lv.used += rest.length; }
+  if (!lv.loop) { lv.loop = true; let last = performance.now(); requestAnimationFrame(function frame(now) {
+    const dt = Math.min(0.1, (now - last) / 1000); last = now;
+    const backlog = lv.text.length - lv.shown;
+    lv.rate += ((18 + Math.min(42, backlog * 0.6)) - lv.rate) * Math.min(1, dt * 2); // ease towards the target pace: no sudden speed changes
+    lv.shown = Math.min(lv.text.length, lv.shown + lv.rate * dt);
+    // caught up (sentence spoken): let the leading edge settle to full opacity instead of leaving the last word faded
+    lv.settle = lv.shown < lv.text.length ? 0 : Math.min(1, lv.settle + dt / 0.4);
+    drawLiveText();
+    if (lv.shown < lv.text.length || lv.settle < 1) requestAnimationFrame(frame); else lv.loop = false;
+  }); }
+}
+function drawLiveText() {
+  const l = $('#live'); if (!l || !lv || location.hash !== '#/mote') return;
+  if (!l.firstChild) { l.innerHTML = '<span class="solid"></span><span class="tail"></span>'; }
+  const n = Math.floor(lv.shown), cut = Math.max(0, n - LV_TAIL), frac = lv.shown - n;
+  l.firstChild.textContent = lv.text.slice(0, cut);
+  l.lastChild.innerHTML = [...lv.text.slice(cut, n)].map((c, i, a) => `<span style="opacity:${(o => o + (1 - o) * lv.settle)(Math.max(0.08, Math.min(1, (a.length - i - frac) / LV_TAIL))).toFixed(2)}">${esc(c)}</span>`).join('');
+  if (l.scrollHeight > l.clientHeight) l.scrollTop = l.scrollHeight;
+}
+function renderLiveInto(l) { if (l && lv) { l.innerHTML = ''; drawLiveText(); } } // after a re-render: show what was already written
+
+function onRemoteLive(m) { // live text: Soniox real-time via the server (all devices), or the browser's preview from the recording device
+  if (m.add !== undefined) return liveAdd(m.add, m.partial);
+  if (ra) ra.text = m.text; if (rec) rec.liveText = m.text;
+  const l = $('#live'); if (l && location.hash === '#/mote') l.textContent = m.text;
+}
 
 function setupCanvas(c) {
   const dpr = devicePixelRatio || 1;
   c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
   const g = c.getContext('2d'); g.scale(dpr, dpr); return g;
 }
-function drawLive(bars) {
+// Live waveform: drawn every animation frame; between two samples the bars slide smoothly by the elapsed fraction.
+let liveCtx = null;
+function drawLive(bars, frac = 0) {
   const c = $('#wave'); if (!c) return;
-  const g = setupCanvas(c), w = c.clientWidth, h = c.clientHeight, step = 4, view = bars.slice(-(Math.floor(w / step) - 10));
-  g.fillStyle = '#d0d5dd'; g.fillRect(0, h / 2 - 0.5, w, 1);
+  const dpr = devicePixelRatio || 1, w = c.clientWidth, h = c.clientHeight;
+  if (!liveCtx || liveCtx.canvas !== c || c.width !== Math.round(w * dpr)) { liveCtx = setupCanvas(c); } // resize only when needed
+  const g = liveCtx; g.clearRect(0, 0, w, h);
+  const step = 4, max = Math.floor(w / step) - 6, scrolling = bars.length > max, view = bars.slice(-max - 1);
+  const shift = scrolling ? -frac * step : 0, head = Math.min(bars.length, max) * step + (scrolling ? 0 : frac * step);
+  g.fillStyle = '#e4e7ec'; g.fillRect(0, h / 2 - 0.5, w, 1);
   g.fillStyle = '#e73534';
-  view.forEach((v, i) => { const bh = Math.max(2, v * h * 0.9); g.fillRect(i * step, (h - bh) / 2, 2.5, bh); });
-  g.fillStyle = '#101828'; g.fillRect(view.length * step, 4, 2, h - 8);
+  view.forEach((v, i) => {
+    const x = (scrolling ? i - 1 : i) * step + shift; if (x < -step) return;
+    const bh = Math.max(2, v * h * 0.85);
+    if (g.roundRect) { g.beginPath(); g.roundRect(x, (h - bh) / 2, 2.5, bh, 1.25); g.fill(); } else g.fillRect(x, (h - bh) / 2, 2.5, bh);
+  });
+  g.fillStyle = '#101828'; g.fillRect(head, 4, 2, h - 8);
 }
 
 async function startRecording() {
+  try { await api('POST', '/api/session', { action: 'start', device: DEVICE }); } // the server makes sure only one device records
+  catch (e) { return alert(e.message); }
   const state = { bars: [], start: Date.now(), chunks: [], segments: [], lang: recLang() };
   try {
     state.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
     state.ctx = new AudioContext();
     state.analyser = state.ctx.createAnalyser(); state.analyser.fftSize = 1024;
-    state.ctx.createMediaStreamSource(state.stream).connect(state.analyser);
+    const src = state.ctx.createMediaStreamSource(state.stream); src.connect(state.analyser);
+    // Live audio stream to the other devices: 16 kHz mono PCM, 4-byte sample index + Int16 samples per frame.
+    const proc = state.ctx.createScriptProcessor(2048, 1, 1), ratio = state.ctx.sampleRate / SR_STREAM;
+    state.sampleIdx = 0; state.local = newStream(0);
+    proc.onaudioprocess = e => {
+      const inp = e.inputBuffer.getChannelData(0), n = Math.floor(inp.length / ratio), out = new Int16Array(n);
+      for (let i = 0; i < n; i++) out[i] = Math.max(-1, Math.min(1, inp[Math.floor(i * ratio)])) * 32767;
+      if (audioWs?.readyState === 1 && rec === state) {
+        const buf = new ArrayBuffer(4 + out.byteLength);
+        new DataView(buf).setUint32(0, state.sampleIdx, true); new Int16Array(buf, 4).set(out);
+        audioWs.send(buf);
+      }
+      feed(state.local, state.sampleIdx, out); // the recorder draws from the same stream model (smooth, same delay)
+      state.sampleIdx += n;
+    };
+    src.connect(proc); proc.connect(state.ctx.destination); state.proc = proc; // (outputs silence; needed for processing to run)
     state.mr = new MediaRecorder(state.stream); // saves the audio so the doctor can listen back
     state.mr.ondataavailable = e => e.data.size && state.chunks.push(e.data);
     state.mr.start(1000);
     state.start = Date.now(); // t=0 is when audio actually starts (not before the mic permission prompt)
   } catch { state.simulated = true; }
-  rec = state; renderRecord();
+  rec = state; ra = null; resetLive(); renderMeeting();
   if (state.simulated) $('#hint').textContent = 'Ingen mikrofon, inget ljud sparas';
 
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (SR) { // live Swedish speech recognition (Chrome sends audio to Google, demo only)
+  const SR = !sonioxLive && (window.SpeechRecognition || window.webkitSpeechRecognition); // fallback only: Soniox real-time gives the live text via the server
+  if (SR) { // live preview text from the browser
     const sr = new SR(); sr.lang = state.lang; sr.continuous = true; sr.interimResults = true;
     sr.onresult = e => {
       let interim = '';
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const res = e.results[i];
-        state.phraseStart ??= (Date.now() - state.start) / 1000; // when this phrase began, for click-to-play
-        if (res.isFinal) {
-          state.segments.push({ text: res[0].transcript.trim(), conf: res[0].confidence || 0.9, start: Math.max(0, state.phraseStart - 0.5) });
-          state.phraseStart = null;
-        } else interim += res[0].transcript;
+        state.phraseStart ??= (Date.now() - state.start) / 1000;
+        if (res.isFinal) { state.segments.push({ text: res[0].transcript.trim(), conf: res[0].confidence || 0.9, start: Math.max(0, state.phraseStart - 0.5) }); state.phraseStart = null; }
+        else interim += res[0].transcript;
       }
       state.interim = interim;
-      const l = $('#live'); if (l && rec === state) l.textContent = [...state.segments.slice(-2).map(x => x.text), interim].join(' ').trim();
+      state.liveText = [...state.segments.slice(-2).map(x => x.text), interim].join(' ').trim();
+      const l = $('#live'); if (l && rec === state) l.textContent = state.liveText;
     };
     sr.onerror = e => {
       state.srError = e.error;
@@ -175,23 +371,30 @@ async function startRecording() {
     try { sr.start(); state.sr = sr; } catch {}
   }
   const buf = new Uint8Array(1024);
+  let level = 0; // smoothed amplitude so bars don't jitter
   state.timer = setInterval(() => {
     let v = 0.1 + Math.random() * 0.4;
     if (state.analyser) { state.analyser.getByteTimeDomainData(buf); v = Math.sqrt(buf.reduce((s, x) => s + ((x - 128) / 128) ** 2, 0) / buf.length) * 4; }
-    state.bars.push(Math.min(1, v));
-    if (rec === state) { drawLive(state.bars); const t = $('#timer'); if (t) t.textContent = fmtDur((Date.now() - state.start) / 1000); }
+    level = level * 0.45 + Math.min(1, v) * 0.55;
+    state.bars.push(+level.toFixed(3)); state.lastBar = performance.now();
+    const t = $('#timer'); if (t && rec === state) t.textContent = fmtDur((Date.now() - state.start) / 1000);
   }, BAR_MS);
+  state.liveTimer = setInterval(() => { // stream waveform + live text to the other devices (shown live there)
+    if (!sonioxLive && ws?.readyState === 1) ws.send(JSON.stringify({ type: 'live', device: DEVICE, text: state.liveText || '', elapsed: (Date.now() - state.start) / 1000 }));
+  }, 250);
+  if (state.local) playOut(state.local, () => rec === state); // smooth, and delayed exactly like the other screens
+  else { const frame = () => { if (rec !== state) return; drawLive(state.bars, 0); requestAnimationFrame(frame); }; requestAnimationFrame(frame); } // no mic: simulated
 }
 
-// Stopping creates the recording on the server and returns to an idle recorder right away.
-// Audio upload and transcript processing continue in the background; all devices see the result.
+// Stopping saves the meeting on the server; every device then opens the transcript. Upload and processing continue in the background.
 async function stopRecording() {
   const state = rec; rec = null;
-  clearInterval(state.timer);
+  clearInterval(state.timer); clearInterval(state.liveTimer); state.proc?.disconnect();
   const duration = (Date.now() - state.start) / 1000;
-  const bars = state.bars.filter((_, i) => i % 2 === 0).map(v => +v.toFixed(2)); // half resolution is plenty for display
-  renderRecord();
-  const created = api('POST', '/api/recordings', { duration, bars }).catch(e => (alert(`Kunde inte spara inspelningen: ${e.message}`), null));
+  const bars = (state.local?.bars.length ? state.local.bars : state.bars).filter((_, i) => i % 2 === 0).map(v => +v.toFixed(2)); // half resolution is plenty for display
+  await api('POST', '/api/session', { action: 'stop', device: DEVICE }).catch(() => {});
+  renderMeeting();
+  const created = api('POST', '/api/recordings', { duration, bars, device: DEVICE }).catch(e => (alert(`Kunde inte spara inspelningen: ${e.message}`), null));
 
   const srDone = state.sr ? new Promise(res => { state.sr.onend = res; state.sr.stop(); setTimeout(res, 1500); }) : null;
   const audioDone = state.mr?.state === 'recording' ? new Promise(res => { state.mr.onstop = res; state.mr.stop(); }) : null;
@@ -200,6 +403,7 @@ async function stopRecording() {
   if (state.interim?.trim()) state.segments.push({ text: state.interim.trim(), conf: 0.6, start: Math.max(0, (state.phraseStart ?? duration) - 0.5) });
 
   const r = await created; if (!r) return;
+  location.hash = `#/r/${r.id}`;
   if (state.chunks.length) await api('PUT', `/api/recordings/${r.id}/audio`, new Blob(state.chunks, { type: state.mr.mimeType }), state.mr.mimeType || 'audio/webm').catch(() => {});
   await api('POST', `/api/recordings/${r.id}/transcript`, { segments: state.segments, srError: state.srError, noSpeechRecognition: !state.sr, lang: state.lang }).catch(() => {});
 }
@@ -239,6 +443,25 @@ function drawPlayer(r, t = 0) {
   g.fillStyle = '#101828'; g.fillRect(at * w, 0, 2, h);
 }
 
+/* ---------- speaker roles ---------- */
+const ROLE = { 'Läkare': { a: 'läk', c: 'sl' }, 'Patient': { a: 'pat', c: 'sp' }, 'Sjuksköterska': { a: 'ssk', c: 'sn' }, 'Anhörig': { a: 'anh', c: 'sa' },
+  'Tolk': { a: 'tolk', c: 'st' }, 'Annan vårdpersonal': { a: 'vård', c: 'so' }, 'Övrig': { a: 'övr', c: 'sx' }, 'Okänd': { a: '?', c: '' } };
+function speakerMenu(r, lineId, anchor) { // pick the role for this voice; with a Soniox voice id it applies to all of that voice's lines
+  document.querySelector('.spkmenu')?.remove();
+  const u = r.transcript.find(x => x.id === lineId), m = document.createElement('div');
+  m.className = 'menu spkmenu';
+  m.innerHTML = `<div class="small muted" style="padding:4px 8px">${u.voice ? `Röst ${esc(u.voice)}: gäller alla dess repliker` : 'Gäller den här repliken'}</div>`
+    + Object.keys(ROLE).map(k => `<button data-role="${k}">${k}</button>`).join('');
+  anchor.after(m);
+  m.onclick = async e => {
+    const role = e.target.closest('[data-role]')?.dataset.role; if (!role) return;
+    const detail = ['Anhörig', 'Annan vårdpersonal'].includes(role) ? (prompt(role === 'Anhörig' ? 'Relation (t.ex. dotter, make)' : 'Yrke (t.ex. fysioterapeut)', '') || '') : '';
+    m.remove();
+    await api('POST', `/api/recordings/${r.id}/speaker`, { line: lineId, role, detail }).catch(err => alert(err.message));
+  };
+}
+document.addEventListener('click', e => { if (!e.target.closest('.spkmenu, [data-spk]')) document.querySelector('.spkmenu')?.remove(); });
+
 /* ---------- detail view: transcript + document flow ---------- */
 const FLOW = {
   journal: { label: 'Journal', desc: 'Journalanteckning från samtalet', needs: null },
@@ -257,20 +480,20 @@ function renderDetail(r) {
   loadAudio(r);
   const keep = { t: $('#transcript')?.scrollTop, s: $('.side-col')?.scrollTop, id: $('.detail')?.dataset.id }; // keep scroll on live re-render
   const conf = c => (c < 0.6 ? 'low' : c < 0.85 ? 'mid' : '');
-  const patient = PATIENTS.find(p => p.id === r.patient);
+  const patient = patientOf(r.patient);
   const lines = r.transcript.map(x => `
-    <div class="tline" id="${x.id}" data-t="${x.start ?? ''}"><span class="spk ${x.speaker === 'Läkare' ? 'sl' : x.speaker === 'Patient' ? 'sp' : ''}">${{ Läkare: 'läk:', Patient: 'pat:' }[x.speaker] || 'tal:'}</span>
+    <div class="tline" id="${x.id}" data-t="${x.start ?? ''}"><button class="spk ${ROLE[x.speaker]?.c || ''}" data-spk="${x.id}" title="${esc(x.speaker || 'Okänd')}${x.speakerDetail ? ` (${esc(x.speakerDetail)})` : ''}${x.voice ? ` · röst ${esc(x.voice)}` : ''}. Klicka för att ändra.">${ROLE[x.speaker]?.a || '?'}${x.speakerDetail && x.speaker !== 'Patient' && x.speaker !== 'Läkare' ? `<small>${esc(x.speakerDetail)}</small>` : ''}</button>
       <span dir="auto">${x.words.map(w => conf(w.c) ? `<span class="w ${conf(w.c)}" title="Konfidens ${Math.round(w.c * 100)} %">${esc(w.w)}</span>` : esc(w.w)).join(' ')}</span>
       <span class="ts">${x.start != null ? fmtDur(x.start) : ''}</span></div>`).join('');
   $('#view').innerHTML = `
     <div class="detail" data-id="${r.id}">
-      <header class="dhead"><a href="#/" class="icon back" aria-label="Tillbaka">${ICON.back}</a>
-        <div><h1>${r.id} · ${esc(r.title)}</h1><span class="muted small">${patient ? esc(patient.name) + ' · ' : ''}${fmtTime(r.createdAt)} · ${fmtDur(r.duration)}${r.lang && !/^sv(-SE)?$/.test(r.lang) ? ` · samtal på ${LANGS[r.lang] || r.lang.split('+').map(c => LANGNAME[c] || c).join(' + ')}, dokument på svenska` : ''}${r.stt === 'soniox' ? ' · Soniox' : ''}</span></div></header>
+      <header class="dhead"><a href="#/mote" class="icon back" id="again" aria-label="Spela in igen" title="Spela in igen">${ICON.back}</a>
+        <div><h1>${r.id} · ${esc(r.title)}</h1><span class="muted small">${patient ? `<a href="#/p/${patient.id}">${esc(patient.name)}</a> · ${esc(patient.personnummer)} · ` : ''}${fmtTime(r.createdAt)} · ${fmtDur(r.duration)}${r.lang && !/^sv(-SE)?$/.test(r.lang) ? ` · samtal på ${LANGS[r.lang] || r.lang.split('+').map(c => LANGNAME[c] || c).join(' + ')}, dokument på svenska` : ''}${r.stt === 'soniox' ? ' · Soniox' : ''}</span></div></header>
       <div class="dgrid ${u.open ? 'doc-open' : ''}">
         <article class="card tcard">
           ${r.note ? `<p class="mock">${esc(r.note)}</p>` : ''}
           ${r.processing ? '<p class="muted">Bearbetar inspelningen: identifierar talare och sammanfattar…</p>' : r.summary ? `<p class="summary">${esc(r.summary)}</p>` : ''}
-          <div class="trow"><h2>Transkribering</h2><span class="legend"><i class="w mid">osäker</i><i class="w low">mycket osäker</i></span></div>
+          <div class="trow"><h2>Transkribering ${r.transcript.length && !r.processing && !r.example ? '<button class="btn sm" id="reprocess" title="Kör talarroller och sammanfattning igen">Analysera talare igen</button>' : ''}${r.audio && sonioxLive && !r.processing ? '<button class="btn sm" id="retranscribe" title="Kör Soniox igen på det inspelade ljudet">Transkribera om</button>' : ''}</h2><span class="legend"><i class="w mid">osäker</i><i class="w low">mycket osäker</i></span></div>
           <div class="transcript" id="transcript">${lines || `<p class="muted">${r.processing ? 'Väntar på transkriptet…' : 'Inget transkript.'}</p>`}</div>
           <div class="player ${r.audio ? '' : 'noaudio'}">
             <button class="icon playbtn" id="playbtn" ${r.audio ? '' : 'disabled'} aria-label="Spela/pausa">${ICON.play}</button>
@@ -290,9 +513,15 @@ function renderDetail(r) {
   const side = $('.side-col');
   side.addEventListener('focusout', e => { const el = e.target.closest?.('[data-path]'); if (!el) return; const v = el.textContent.trim(); if (v !== el.dataset.orig) { el.dataset.orig = v; editDoc(r, 'set', el.dataset.path, v); } });
   side.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && e.target.closest?.('[data-path]')) { e.preventDefault(); e.target.blur(); } });
+  $('#again').onclick = e => { e.preventDefault(); r.patient ? newMeeting(r.patient) : (location.hash = '#/'); }; // back = record again for the same patient
+  $('#retranscribe') && ($('#retranscribe').onclick = () => confirm('Transkribera om från det inspelade ljudet? Utkast som byggde på det gamla transkriptet tas bort.') && api('POST', `/api/recordings/${r.id}/retranscribe`).catch(e => alert(e.message)));
+  $('#reprocess') && ($('#reprocess').onclick = () => api('POST', `/api/recordings/${r.id}/reprocess`).catch(e => alert(e.message)));
   $('#playbtn').onclick = () => { loadAudio(r); player.paused ? player.play() : player.pause(); };
   $('#pwave').onclick = e => { const b = e.target.getBoundingClientRect(); seek(r, (e.clientX - b.left) / b.width * r.duration); };
-  $('#transcript').onclick = e => { const l = e.target.closest('.tline'); if (l?.dataset.t) seek(r, +l.dataset.t); };
+  $('#transcript').onclick = e => {
+    const sp = e.target.closest('[data-spk]'); if (sp) { e.stopPropagation(); return speakerMenu(r, sp.dataset.spk, sp); }
+    const l = e.target.closest('.tline'); if (l?.dataset.t) seek(r, +l.dataset.t);
+  };
   $('.side-col').onclick = async e => {
     const act = (method, path, body) => api(method, `/api/recordings/${r.id}/${path}`, body).catch(err => alert(err.message));
     const n = e.target.closest('[data-node]');
@@ -322,7 +551,7 @@ function retentionText(r) {
   if (r.audioDeleted) return `Ljudet raderades ${retentionDays} dagar efter godkännande. Texten finns kvar.`;
   if (!r.audio) return '';
   if (r.signedAt) return `Godkänt ${fmtTime(r.signedAt)}. Ljudet raderas automatiskt ${fmtTime(Date.parse(r.signedAt) + retentionDays * 864e5)}.`;
-  return `Ljudet sparas tills ett dokument godkänts och raderas ${retentionDays} dagar därefter.`;
+  return '';
 }
 
 function flowHtml(r) {
@@ -427,7 +656,7 @@ async function mountVim(r) {
    Every editable field carries data-path (its place in the document data). Edits are saved to the server on blur,
    so they survive re-renders and show up on every device; the FK checks are re-run on the server. */
 const refs = ids => ids?.length ? `<sup>${ids.join(' ')}</sup>` : '';
-const ed = (path, text, ids, level = 'ok') => `<span class="claim ${level}" data-path="${path}" data-orig="${esc(text)}" data-ev="${(ids || []).join(',')}" contenteditable>${esc(text)}</span>${refs(ids)} `;
+const ed = (path, text, ids, level = 'ok') => `<span class="claim ${level}" data-path="${path}" data-orig="${esc(text)}" data-ev="${(ids || []).join(',')}" contenteditable spellcheck="false">${esc(text)}</span>${refs(ids)} `;
 const claimSpan = (path, text, ids, level) => ed(path, text, ids, level) + (ids && !ids.length ? '<sup class="bad">ingen källa</sup>' : '');
 const addBtn = (path, label) => `<button class="add" data-add="${path}">+ ${label}</button>`;
 const rm = path => `<button class="rm" data-remove="${path}" title="Ta bort">&times;</button>`;
@@ -521,9 +750,9 @@ async function downloadPdf(r, formId) {
     return x.textContent.replace(/\s+/g, ' ').trim();
   };
   const [icd10, ...rest] = field('diagnosis').split(' ');
-  const patient = PATIENTS.find(p => p.id === r.patient);
+  const patient = patientOf(r.patient);
   const body = {
-    patient: patient ? patient.name : 'Ny patient', personnummer: 'ÅÅÅÅMMDD-XXXX (demo)', date: isoDate(r.createdAt),
+    patient: patient ? patient.name : 'Ny patient', personnummer: patient?.personnummer || '', date: isoDate(r.createdAt),
     occupation: field('occupation'), icd10, diagnosis: rest.join(' '),
     function_impairment: field('function_impairment'), activity_limitation: field('activity_limitation'), treatment: field('treatment'),
     degree: c.sick_leave.degree, from: isoDate(Date.now()), to: isoDate(Date.now() + (c.sick_leave.days - 1) * 864e5), motivation: c.motivation_longer_leave,
@@ -533,10 +762,10 @@ async function downloadPdf(r, formId) {
   return savePdf(formId, body, r);
 }
 function downloadAg114(r) {
-  const a = r.docs.arb.data, patient = PATIENTS.find(p => p.id === r.patient);
+  const a = r.docs.arb.data, patient = patientOf(r.patient);
   const text = cls => [...document.querySelectorAll(`[data-arb="${cls}"] .claim`)].map(x => x.textContent.trim()).join(' ');
   return savePdf('ag114', {
-    patient: patient ? patient.name : 'Ny patient', personnummer: 'ÅÅÅÅMMDD-XXXX (demo)', date: isoDate(r.createdAt),
+    patient: patient ? patient.name : 'Ny patient', personnummer: patient?.personnummer || '', date: isoDate(r.createdAt),
     occupation: a.occupation, description: text('description'), capacity_despite: text('adjustments'),
     degree: a.work_capacity_reduced ? a.degree : '', from: isoDate(Date.now()), to: isoDate(Date.now() + (Math.max(1, a.days) - 1) * 864e5),
   }, r);
@@ -554,14 +783,6 @@ document.addEventListener('click', e => {
 });
 
 /* ---------- patients & settings ---------- */
-function renderPatients() {
-  $('#view').innerHTML = `<div class="page"><h1>Patienter</h1><p class="muted">Syntetiska demopatienter, ingen riktig patientdata.</p>
-    ${PATIENTS.map(p => {
-      const recs = recordings.filter(r => r.patient === p.id);
-      return `<div class="card prow"><div><b>${esc(p.name)}</b><span class="muted small"> · ${p.age} år</span></div>
-        <div class="chips">${recs.map(r => `<a class="chip" href="#/r/${r.id}">${r.id} · ${fmtTime(r.createdAt)}</a>`).join('') || '<span class="muted small">Inga inspelningar</span>'}</div></div>`;
-    }).join('')}</div>`;
-}
 async function renderSettings() {
   const hasSR = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
   $('#view').innerHTML = `<div class="page"><h1>Inställningar</h1>

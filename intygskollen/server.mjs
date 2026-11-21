@@ -8,7 +8,7 @@ import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import { z } from 'zod';
 import { runChecks } from './rules.mjs';
 import { buildFk7804, buildAg114, buildAg7804 } from './pdf.mjs';
-import { init, createApi } from './store.mjs';
+import { init, createApi, attachWs } from './store.mjs';
 import { sonioxConfigured } from './soniox.mjs';
 
 try { process.loadEnvFile(); } catch {} // optional .env with ANTHROPIC_API_KEY
@@ -83,10 +83,10 @@ async function llm(schema, system, user, opts = {}) {
 // House style: no en/em dashes in generated text.
 const noDashes = v => typeof v === 'string' ? v.replace(/\s+[–—]\s+/g, ', ').replace(/[–—]/g, '-')
   : Array.isArray(v) ? v.map(noDashes) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, noDashes(x)])) : v;
-const fmt = transcript => transcript.map(u => `${u.id} [${u.speaker}]: ${u.text}`).join('\n');
+const fmt = transcript => transcript.map(u => `${u.id} [${u.speaker}${u.speakerDetail ? `, ${u.speakerDetail}` : ''}]: ${u.text}`).join('\n');
 // Documents later in the flow (FK, employer) also get the doctor's journal note as context; evidence must still cite transcript lines.
 const withJournal = j => (j ? `\n\nJournalanteckning (granskad av läkaren, som sammanhang; evidence ska fortfarande vara transkriptets rad-ID:n):\n${j}` : '');
-const GROUNDING = 'Använd ENDAST information som finns i transkriptet. Hitta aldrig på fynd, mätvärden, diagnoser eller uppgifter. Varje mening ska ha evidence = ID:n för de rader som stöder den. Använd inte tankstreck (– eller —). Samtalet kan vara på ett annat språk än svenska; skriv ändå alltid dokumentet på svenska.';
+const GROUNDING = 'Varje rad anger vem som talar (läkare, patient, sjuksköterska, anhörig, tolk m.fl.). Repliker från Övrig (personer utan del i vården) är inte medicinsk information. Det en anhörig eller annan person säger om patienten ska återges som deras uppgift, inte som patientens egen. Använd ENDAST information som finns i transkriptet. Hitta aldrig på fynd, mätvärden, diagnoser eller uppgifter. Varje mening ska ha evidence = ID:n för de rader som stöder den. Använd inte tankstreck (– eller —). Samtalet kan vara på ett annat språk än svenska; skriv ändå alltid dokumentet på svenska.';
 
 export async function analyze({ transcript, journal, lang }, opts = {}) {
   const { out: cert, usage } = await llm(Certificate, SYSTEM, `Transkript:\n${fmt(transcript)}${withJournal(journal)}\n\nSkriv utkastet.`, opts);
@@ -97,7 +97,8 @@ export async function analyze({ transcript, journal, lang }, opts = {}) {
 const Processed = z.object({
   segments: z.array(z.object({
     id: z.string(),
-    speaker: z.enum(['Läkare', 'Patient']),
+    speaker: z.enum(['Läkare', 'Patient', 'Sjuksköterska', 'Anhörig', 'Tolk', 'Annan vårdpersonal', 'Övrig', 'Okänd']),
+    speaker_detail: z.string().describe('e.g. "dotter", "make", "fysioterapeut"; empty if unknown'),
     suspect_words: z.array(z.string()).describe('Words in this segment that look like speech-recognition errors (exact words as written)'),
   })),
   title: z.string().describe('Short Swedish title, e.g. "Ländryggssmärta, lagerarbetare"'),
@@ -105,7 +106,7 @@ const Processed = z.object({
 });
 async function processTranscript({ transcript, lang }) {
   const { out } = await llm(Processed,
-    'Du får ett automatiskt transkriberat samtal mellan läkare och patient i svensk primärvård, uppdelat i segment utan talarangivelse. Avgör för varje segment vem som talar utifrån innehållet (läkaren ställer frågor, undersöker, bedömer; patienten beskriver besvär). Markera ord som troligen är feltolkade av taligenkänningen (t.ex. medicinska termer som blivit fel). Skriv en kort sammanfattning. ' + GROUNDING,
+    'Du får ett automatiskt transkriberat vårdsamtal i svensk primärvård, uppdelat i segment. Segment kan ha ett röstnummer [röst N] från talarsepareringen. Det är ett starkt tips men inte säkert: talarsepareringen kan slå ihop två personer med liknande röster eller korta inpass. Ge normalt samma roll åt samma röst, men om innehållet tydligt visar att det är en annan person (t.ex. någon som kommer in i rummet, en annan relation till patienten, ett annat språk och sätt att tala) går innehållet före röstnumret. Tolk: en replik som återger det föregående replik sa, på ett annat språk (eller som återger patientens svar på svenska till läkaren), är Tolk, även om den har samma röstnummer som läkaren. Läkaren ställer egna frågor och gör bedömningar; tolken lägger inte till eget innehåll. Bara om det tydligt är läkaren själv som översätter (t.ex. "jag översätter") är det Läkare. Avgör för varje segment vem som talar utifrån innehållet: Läkare (ställer diagnos, undersöker, bedömer, förskriver), Patient (beskriver egna besvär i jagform), Sjuksköterska (mäter värden, praktiska moment, provtagning), Anhörig (familjemedlem eller närstående; talar om patienten i tredje person, t.ex. "min mamma"), Tolk (återger det som sägs på ett annat språk), Annan vårdpersonal (t.ex. fysioterapeut, undersköterska, kurator), Övrig (person utan del i vården, t.ex. vaktmästare eller annan som kommer in i rummet), Okänd. Ange speaker_detail när det framgår (t.ex. "dotter", "make", "fysioterapeut", annars tom sträng). Markera ord som troligen är feltolkade av taligenkänningen (t.ex. medicinska termer som blivit fel). Skriv en kort sammanfattning där det framgår vem som sa vad när det spelar roll.' + GROUNDING,
     `Språk (taligenkänning): ${lang || 'sv-SE'}. Titel och sammanfattning på svenska; suspect_words exakt som de står i segmenten.\nSegment:\n${transcript.map(u => `${u.id}: ${u.text}`).join('\n')}`, { effort: 'low' });
   return out;
 }
@@ -185,7 +186,7 @@ export async function generateDoc(kind, { transcript, journal }) {
 const api = createApi({ analyze, generateDoc, processTranscript, rankCards });
 const TYPES = { '.svg': 'image/svg+xml', '.webp': 'image/webp', '.png': 'image/png', '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
 if (!process.env.NO_SERVER) await init();
-if (!process.env.NO_SERVER) http.createServer(async (req, res) => {
+const httpServer = process.env.NO_SERVER ? null : http.createServer(async (req, res) => {
   // Optional password (HTTP Basic auth, any username) so a public URL can't spend the API key.
   if (ACCESS_PASSWORD) {
     const [, b64] = (req.headers.authorization || '').split(' ');
@@ -235,4 +236,5 @@ if (!process.env.NO_SERVER) http.createServer(async (req, res) => {
     res.writeHead(status, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: e.message }));
   }
-}).listen(PORT, () => console.log(`Intygskollen on http://localhost:${PORT}`));
+});
+if (httpServer) { attachWs(httpServer); httpServer.listen(PORT, () => console.log(`Intygskollen on http://localhost:${PORT}`)); }
