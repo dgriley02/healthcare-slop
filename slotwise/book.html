@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Slotwise – Book an appointment</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="portal-top"><div class="in"><div class="logo"><i></i>Lund Health Centre</div><span class="small muted">Patient portal</span></div></div>
+<div class="portal">
+  <div class="tabs">
+    <button class="on" data-tab="book">Book appointment</button>
+    <button data-tab="manage">Manage booking</button>
+    <button data-tab="wait">Join waiting list</button>
+  </div>
+
+  <!-- Book -->
+  <section id="t-book" class="card"><div class="bd">
+    <form id="bForm">
+      <h2>Book an appointment</h2>
+      <div class="field-row">
+        <div><label>Full name</label><input name="name" required autocomplete="name"></div>
+        <div><label>Mobile number</label><input name="phone" required autocomplete="tel" placeholder="07x xxx xx xx"></div>
+      </div>
+      <div class="field-row">
+        <div><label>Age</label><input name="age" type="number" min="0" max="120" required></div>
+        <div><label>Reason for visit</label><select name="reason"><option>Check-up</option><option>Follow-up</option><option>Vaccination</option><option>Blood test</option><option>Prescription renewal</option><option>Consultation</option></select></div>
+      </div>
+      <label>Day</label><div class="chips" id="days"></div>
+      <label>Time</label><div class="chips" id="times"><span class="small muted">Choose a day first</span></div>
+      <label style="display:flex;gap:8px;align-items:center;font-weight:400"><input type="checkbox" name="sms" checked style="width:auto"> Send me an SMS reminder with a link to confirm or cancel</label>
+      <label style="display:flex;gap:8px;align-items:center;font-weight:400"><input type="checkbox" name="earlier" style="width:auto"> Offer me an earlier time if one becomes available</label>
+      <div id="bErr" class="small down"></div>
+      <br><button class="btn pri">Confirm booking</button>
+    </form>
+    <div id="bDone" class="hide"></div>
+  </div></section>
+
+  <!-- Manage -->
+  <section id="t-manage" class="card hide"><div class="bd">
+    <h2>Manage your booking</h2>
+    <p class="muted">Enter the booking reference from your confirmation or SMS.</p>
+    <form id="mForm" class="row"><input name="ref" placeholder="SW-XXXX" style="max-width:200px" required><button class="btn pri">Find booking</button></form>
+    <div id="mOut"></div>
+  </div></section>
+
+  <!-- Waiting list -->
+  <section id="t-wait" class="card hide"><div class="bd">
+    <form id="wForm">
+      <h2>Join the waiting list</h2>
+      <p class="muted">When someone cancels, we text the next person on the list. Reply within the time stated to take the slot.</p>
+      <div class="field-row">
+        <div><label>Full name</label><input name="name" required></div>
+        <div><label>Mobile number</label><input name="phone" required></div>
+      </div>
+      <div class="field-row">
+        <div><label>Age</label><input name="age" type="number" min="0" max="120" required></div>
+        <div><label>Reason for visit</label><input name="reason" value="Consultation"></div>
+      </div>
+      <br><button class="btn pri">Join waiting list</button>
+    </form>
+    <div id="wDone" class="hide notice success"></div>
+  </div></section>
+
+  <p class="small muted" style="text-align:center;margin-top:24px">Demo only – no real patient data. <a href="index.html">Clinic view</a></p>
+</div>
+
+<script src="model.js"></script>
+<script src="app.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+let day = null, time = null;
+
+document.querySelectorAll('[data-tab]').forEach(b => b.onclick = () => {
+  document.querySelectorAll('[data-tab]').forEach(x => x.classList.toggle('on', x === b));
+  document.querySelectorAll('section').forEach(s => s.classList.toggle('hide', s.id !== 't-' + b.dataset.tab));
+});
+
+function workdays(n) {
+  const out = []; for (let d = today(); out.length < n; d = addDays(d, 1)) if (!isWeekend(d)) out.push(iso(d)); return out;
+}
+function renderDays() {
+  $('#days').innerHTML = workdays(10).map(d => {
+    const free = SLOTS.filter(t => slotFree(d, t)).length;
+    return `<button type="button" class="chip ${d === day ? 'on' : ''}" data-day="${d}" ${free ? '' : 'disabled'}>${fmtDay(d)}<small>${free ? free + ' free' : 'Full'}</small></button>`;
+  }).join('');
+}
+function renderTimes() {
+  if (!day) return;
+  const now = new Date(), isToday = day === iso(today());
+  $('#times').innerHTML = SLOTS.map(t => {
+    const past = isToday && t <= `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+    return `<button type="button" class="chip ${t === time ? 'on' : ''}" data-time="${t}" ${slotFree(day, t) && !past ? '' : 'disabled'}>${t}</button>`;
+  }).join('');
+}
+$('#days').onclick = e => { const b = e.target.closest('[data-day]'); if (!b) return; day = b.dataset.day; time = null; renderDays(); renderTimes(); };
+$('#times').onclick = e => { const b = e.target.closest('[data-time]'); if (!b) return; time = b.dataset.time; renderTimes(); };
+window.addEventListener('storage', () => { renderDays(); renderTimes(); });
+
+$('#bForm').onsubmit = e => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target));
+  if (!day || !time) return $('#bErr').textContent = 'Please choose a day and time.';
+  if (!slotFree(day, time)) { $('#bErr').textContent = 'That time was just taken. Please choose another.'; time = null; renderDays(); return renderTimes(); }
+  const b = addBooking({ name: f.name, phone: f.phone, age: +f.age, reason: f.reason, date: day, time, sms: false, prevNoShows: historyFor(f.phone) });
+  log(`New booking: ${who(b)} via patient portal`, 'info');
+  if (f.sms) sendSms(b.id);
+  if (f.earlier) addToWaitlist({ name: f.name, phone: f.phone, age: +f.age, reason: f.reason });
+  e.target.classList.add('hide');
+  $('#bDone').classList.remove('hide');
+  $('#bDone').innerHTML = `<h2>Your appointment is booked</h2>
+    <div class="notice success"><div class="small muted">Booking reference</div><div class="refcode">${b.ref}</div></div>
+    <dl class="kv"><dt>When</dt><dd>${fmtLong(b.date)} at ${b.time}</dd><dt>Reason</dt><dd>${esc(b.reason)}</dd><dt>Reminder</dt><dd>${f.sms ? 'SMS to ' + esc(b.phone) : 'None'}</dd></dl>
+    <p class="muted">Can't make it? Cancel as early as you can under <i>Manage booking</i> – your slot goes straight to someone on the waiting list.</p>
+    <button class="btn" onclick="location.reload()">Book another</button>`;
+};
+
+function renderManage(b) {
+  if (!b) return $('#mOut').innerHTML = '<p class="down">No booking found with that reference.</p>';
+  const up = b.status === 'booked' && parse(b.date) >= today();
+  const st = b.status === 'cancelled' ? 'Cancelled' : b.status === 'attended' ? 'Completed' : b.status === 'noshow' ? 'Missed' : b.confirmed ? 'Confirmed' : 'Booked';
+  $('#mOut').innerHTML = `<div class="notice"><dl class="kv" style="margin:0"><dt>Patient</dt><dd>${esc(b.name)}</dd><dt>When</dt><dd>${fmtLong(b.date)} at ${b.time}</dd>
+    <dt>Reason</dt><dd>${esc(b.reason)}</dd><dt>Status</dt><dd><b>${st}</b></dd></dl></div>
+    ${up ? `<div class="row">${b.confirmed ? '' : `<button class="btn pri" data-m="confirm">I will attend</button>`}<button class="btn danger" data-m="cancel">Cancel appointment</button></div>
+    <p class="small muted">Cancelling gives your time to the next patient on the waiting list.</p>` : ''}`;
+  $('#mOut').onclick = e => {
+    const a = e.target.dataset.m; if (!a) return;
+    if (a === 'confirm') { updateBooking(b.id, { confirmed: true }); log(`${b.name} confirmed attendance via patient portal`, 'ok'); }
+    if (a === 'cancel') cancelBooking(b.id, 'patient via portal');
+    renderManage(findBooking(b.id));
+  };
+}
+$('#mForm').onsubmit = e => { e.preventDefault(); renderManage(findByRef(e.target.ref.value)); };
+
+$('#wForm').onsubmit = e => {
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target));
+  addToWaitlist({ ...f, age: +f.age });
+  e.target.classList.add('hide');
+  $('#wDone').classList.remove('hide');
+  $('#wDone').innerHTML = `<b>You are on the waiting list.</b> We will text ${esc(f.phone)} as soon as a time becomes available.`;
+};
+
+const q = new URLSearchParams(location.search).get('ref');
+if (q) { document.querySelector('[data-tab="manage"]').click(); $('#mForm').ref.value = q; renderManage(findByRef(q)); }
+renderDays();
+</script>
+</body>
+</html>
