@@ -17,7 +17,7 @@ const MEASURABLE = /\d|grader|°|positiv|negativ|nedsatt|kraft|rörlighet|lasegu
 
 // lang: BCP-47 code of the conversation. The word-overlap check only works when the transcript is Swedish like the certificate.
 export function runChecks(cert, transcript, lang = 'sv-SE') {
-  const swedish = !lang || lang.startsWith('sv');
+  const swedish = !lang || lang === 'sv' || /^sv-[A-Z]+$/.test(lang); // 'sv+he' (mixed) counts as non-Swedish
   const byId = Object.fromEntries(transcript.map(u => [u.id, u.text]));
   const flags = [];
 

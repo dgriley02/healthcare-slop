@@ -200,3 +200,15 @@ input:focus, select:focus { outline: 2px solid var(--accentsoft); border-color: 
 @media (max-width: 820px) { .rail .brand { display: none; } .rail { border-right: 0; border-top: 1px solid var(--line); } }
 .langpick { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin: 0; font-weight: 500; }
 .langpick select { padding: 5px 8px; width: auto; }
+.eyebrow { font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--brand); margin: 0 0 4px; }
+.fkhead p { margin: 2px 0 0; } .actions .btn { margin-top: 6px; }
+.after-h { margin: 22px 0 8px; }
+.after-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; }
+.after-grid .node { padding: 10px 12px; grid-template-columns: 1fr; }
+.after-grid .node .na { grid-row: auto; grid-column: 1; margin-top: 4px; }
+table.rx { width: 100%; border-collapse: collapse; font-size: 13px; margin-bottom: 8px; }
+table.rx th { text-align: left; font-size: 11px; color: var(--muted); font-weight: 600; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+table.rx td { padding: 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+ul.items { padding-left: 18px; margin: 0; } ul.items li { margin-bottom: 6px; }
+ul.todo { list-style: none; padding: 0; } ul.todo li { display: flex; flex-direction: column; gap: 2px; padding: 6px 0; border-bottom: 1px solid var(--line); }
+ul.todo input { width: auto; margin-right: 6px; }

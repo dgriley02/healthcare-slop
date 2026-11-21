@@ -24,11 +24,14 @@ const LANGS = { 'sv-SE': 'Svenska', 'en-US': 'Engelska (USA)', 'en-GB': 'Engelsk
   'so-SO': 'Somaliska', 'ti-ER': 'Tigrinja', 'tr-TR': 'Turkiska', 'ku-TR': 'Kurdiska', 'uk-UA': 'Ukrainska', 'ru-RU': 'Ryska', 'pl-PL': 'Polska',
   'bs-BA': 'Bosniska', 'sr-RS': 'Serbiska', 'fi-FI': 'Finska', 'da-DK': 'Danska', 'nb-NO': 'Norska', 'de-DE': 'Tyska', 'fr-FR': 'Franska',
   'es-ES': 'Spanska', 'it-IT': 'Italienska', 'pt-PT': 'Portugisiska', 'zh-CN': 'Kinesiska', 'th-TH': 'Thailändska', 'vi-VN': 'Vietnamesiska' };
-const recLang = () => LANGS[pref.get('lang')] ? pref.get('lang') : 'sv-SE';
+const LANGNAME = Object.fromEntries(Object.entries(LANGS).map(([c, n]) => [c.slice(0, 2), n.replace(/ \(.*\)/, '')]));
+const recLang = () => 'sv-SE'; // Soniox detects the language(s) itself; the browser preview listens for Swedish
 
 /* ---------- server state ---------- */
 const PATIENTS = [ // synthetic demo patients
   { id: 'P1', name: 'Erik Lund', age: 34 }, { id: 'P2', name: 'Sara Holm', age: 41 }, { id: 'P3', name: 'Amira Haddad', age: 52 },
+  { id: 'P4', name: 'Jonas Berg', age: 27 }, { id: 'P5', name: 'Birgitta Ek', age: 63 }, { id: 'P6', name: 'Ali Karimi', age: 38 },
+  { id: 'P7', name: 'Maja Lind', age: 31 }, { id: 'P8', name: 'Fatima Noor', age: 45 }, { id: 'P9', name: 'Karin Sjö', age: 49 }, { id: 'P10', name: 'Daniel Moore', age: 36 },
 ];
 let recordings = [], retentionDays = 7, online = true;
 const ui = {}; // per-recording view state that is local to this device: { open, vimEditing, wantOpen }
@@ -99,13 +102,12 @@ function renderRecord() {
         <button class="recbtn ${rec ? 'on' : ''}" id="recbtn" aria-label="Starta/stoppa inspelning">${rec ? ICON.stop : ICON.mic}</button>
         <p class="live" id="live"></p>
         <p class="hint" id="hint">${rec ? 'Spelar in. Tryck för att stoppa.' : 'Tryck för att börja spela in samtalet'}</p>
-        <label class="langpick">Språk <select id="lang" ${rec ? 'disabled' : ''}>${Object.entries(LANGS).map(([c, n]) => `<option value="${c}" ${c === (rec?.lang || recLang()) ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+
       </section>
       <aside class="list"><h2>Inspelningar</h2><ul id="list">${listHtml()}</ul>
         <p class="privacy">Synkas mellan dina enheter. Demo: använd bara rollspelade samtal, ingen riktig patientdata.</p></aside>
     </div>`;
   $('#recbtn').onclick = () => (rec ? stopRecording() : startRecording());
-  $('#lang').onchange = e => pref.set('lang', e.target.value);
   $('#list').onclick = async e => {
     const t = e.target.closest('[data-menu],[data-del],[data-rename]'); if (!t) return;
     const { menu, del, rename } = t.dataset;
@@ -143,6 +145,7 @@ async function startRecording() {
     state.mr = new MediaRecorder(state.stream); // saves the audio so the doctor can listen back
     state.mr.ondataavailable = e => e.data.size && state.chunks.push(e.data);
     state.mr.start(1000);
+    state.start = Date.now(); // t=0 is when audio actually starts (not before the mic permission prompt)
   } catch { state.simulated = true; }
   rec = state; renderRecord();
   if (state.simulated) $('#hint').textContent = 'Ingen mikrofon, inget ljud sparas';
@@ -239,8 +242,14 @@ function drawPlayer(r, t = 0) {
 /* ---------- detail view: transcript + document flow ---------- */
 const FLOW = {
   journal: { label: 'Journal', desc: 'Journalanteckning från samtalet', needs: null },
-  fk: { label: 'FK-intyg', desc: 'Läkarintyg för sjukpenning (FK 7804)', needs: 'journal' },
-  arb: { label: 'Arbetsgivare', desc: 'Intyg om arbetsförmåga, utan diagnos', needs: 'journal' },
+  recept: { label: 'Recept', desc: 'Läkemedel, styrka och dosering', needs: null, after: true },
+  lab: { label: 'Labbremiss', desc: 'Analyser och frågeställning', needs: null, after: true },
+  rtg: { label: 'Röntgenremiss', desc: 'Undersökning och frågeställning', needs: null, after: true },
+  remiss: { label: 'Remiss', desc: 'Till specialist eller rehab', needs: null, after: true },
+  uppfoljning: { label: 'Uppföljning', desc: 'Åtgärder till vårdadministratören', needs: null, after: true },
+  patientinfo: { label: 'Patientinfo', desc: 'Meddelande via 1177', needs: null, after: true },
+  arb: { label: 'Dag 8-14', desc: 'Sjuklöneperioden: AG 1-14 till arbetsgivaren', needs: 'journal' },
+  fk: { label: 'Från dag 15', desc: 'Sjukpenning: FK 7804 till Försäkringskassan och AG 7804 till arbetsgivaren', needs: 'journal' },
 };
 function renderDetail(r) {
   const u = uiOf(r);
@@ -256,7 +265,7 @@ function renderDetail(r) {
   $('#view').innerHTML = `
     <div class="detail" data-id="${r.id}">
       <header class="dhead"><a href="#/" class="icon back" aria-label="Tillbaka">${ICON.back}</a>
-        <div><h1>${r.id} · ${esc(r.title)}</h1><span class="muted small">${patient ? esc(patient.name) + ' · ' : ''}${fmtTime(r.createdAt)} · ${fmtDur(r.duration)}${r.lang && !r.lang.startsWith('sv') ? ` · samtal på ${LANGS[r.lang] || r.lang}, dokument på svenska` : ''}</span></div></header>
+        <div><h1>${r.id} · ${esc(r.title)}</h1><span class="muted small">${patient ? esc(patient.name) + ' · ' : ''}${fmtTime(r.createdAt)} · ${fmtDur(r.duration)}${r.lang && !/^sv(-SE)?$/.test(r.lang) ? ` · samtal på ${LANGS[r.lang] || r.lang.split('+').map(c => LANGNAME[c] || c).join(' + ')}, dokument på svenska` : ''}${r.stt === 'soniox' ? ' · Soniox' : ''}</span></div></header>
       <div class="dgrid ${u.open ? 'doc-open' : ''}">
         <article class="card tcard">
           ${r.note ? `<p class="mock">${esc(r.note)}</p>` : ''}
@@ -325,7 +334,10 @@ function flowHtml(r) {
     <div class="tree">
       <div class="node done static"><span class="nl">Transkript</span><span class="nd">${r.processing ? 'Bearbetas…' : `${r.transcript.length} repliker`}</span></div>
       <div class="edge"></div>${node('journal')}
-      <div class="fork"><div>${node('fk')}</div><div>${node('arb')}</div></div>
+      <div class="fork"><div>${node('arb')}</div><div>${node('fk')}</div></div>
+    </div>
+    <h2 class="after-h">Efterarbete</h2>
+    <div class="after-grid">${Object.keys(FLOW).filter(k => FLOW[k].after).map(node).join('')}
     </div>`;
 }
 function docPanel(r) {
@@ -335,9 +347,10 @@ function docPanel(r) {
     <div class="vimbar"><span id="vimMode">-- NORMAL --</span><span class="muted small">Källhänvisningar [U3] i slutet av raden behålls.</span></div>
     <div class="actions"><button class="btn" id="vimCancel">Avbryt</button> <button class="btn pri" id="vimSave">Spara</button></div>`;
   return `<div class="dochead"><button class="btn sm" data-close>&larr; Flöde</button><span>${k === 'journal' && vimOn() ? '<button class="btn sm" data-vimedit>Redigera (Vim)</button> ' : ''}<button class="btn sm" data-regen>Skapa om</button></span></div>
-    ${{ fk: fkHtml, journal: journalHtml, arb: arbHtml }[k](d.data)}
+    ${{ fk: fkHtml, journal: journalHtml, arb: arbHtml, ...AFTER_HTML }[k](d.data)}
     ${k === 'fk' ? webcertHtml(d) : ''}
-    <div class="actions">${k === 'fk' ? '<button class="btn" id="pdfBtn">Ladda ner FK 7804 (PDF)</button> ' : ''}
+    ${k === 'arb' ? `<p class="small muted">${d.data.days > 14 ? '<b>Sjukskrivningen är längre än 14 dagar.</b> Skapa även underlaget för sjukpenning (från dag 15): FK 7804 och AG 7804.' : 'Varar sjukskrivningen längre än 14 dagar behövs även FK 7804 och AG 7804 (från dag 15).'}</p>` : ''}
+    <div class="actions">${k === 'fk' ? '<button class="btn" data-pdf="fk7804">FK 7804 · Försäkringskassan</button> <button class="btn" data-pdf="ag7804">AG 7804 · Arbetsgivaren</button> ' : ''}${k === 'arb' ? '<button class="btn" data-pdf="ag114">AG 1-14 · Arbetsgivaren</button> ' : ''}
       <button class="btn pri" data-sign ${d.signed ? 'disabled' : ''}>${d.signed ? `Signerat ${fmtTime(d.signed)}` : 'Signera'}</button></div>`;
 }
 
@@ -386,15 +399,35 @@ async function mountVim(r) {
   $('#vimSave').onclick = save; $('#vimCancel').onclick = done;
 }
 
+/* ---------- after-work drafts (recept, remisser, uppföljning, patientinfo) ---------- */
+const ed = (text, ids = []) => `<span class="claim" data-ev="${ids.join(',')}" contenteditable>${esc(text) || '&nbsp;'}</span>${ids.length ? refs(ids) : ''}`;
+const blank = v => v ? esc(v) : '<em class="bad">Saknas</em>';
+const dl = rows => `<dl class="fk">${rows.filter(Boolean).map(([t, v]) => `<dt>${t}</dt><dd>${v}</dd>`).join('')}</dl>`;
+const urg = u => `<span class="pill ${u === 'rutin' ? '' : 'warn'}">${esc(u)}</span>`;
+const AFTER_HTML = {
+  recept: d => `<h2>Receptutkast</h2>${d.prescriptions.length ? `<table class="rx"><tr><th>Läkemedel</th><th>Styrka</th><th>Dosering</th><th>Mängd</th><th>Tid</th></tr>
+    ${d.prescriptions.map(p => `<tr><td>${ed(`${p.drug} ${p.form}`.trim(), p.evidence)}<div class="small muted">${esc(p.indication)}</div></td><td>${ed(p.strength)}</td><td>${ed(p.dosage)}</td><td>${ed(p.amount)}</td><td>${ed(p.duration)}</td></tr>`).join('')}</table>`
+    : '<p class="muted">Inga läkemedel förskrevs i samtalet.</p>'}${d.warnings.map(w => `<div class="flag warn">${esc(w)}</div>`).join('')}`,
+  lab: d => `<h2>Labbremiss</h2>${dl([['Frågeställning', ed(d.question)], ['Brådska', urg(d.urgency)], ['Fasta', d.fasting ? 'Ja' : 'Nej']])}
+    <h3>Analyser</h3>${d.tests.length ? `<ul class="items">${d.tests.map(t => `<li><b>${ed(t.name, t.evidence)}</b> <span class="small muted">${esc(t.reason)}</span></li>`).join('')}</ul>` : '<p class="muted">Inga prover nämndes.</p>'}`,
+  rtg: d => `<h2>Röntgenremiss</h2>${dl([['Undersökning', ed(d.exam, d.evidence)], ['Frågeställning', ed(d.question)], ['Anamnes', ed(d.anamnesis)], ['Status', ed(d.status)], ['Brådska', urg(d.urgency)], ['Kontraindikationer', ed(d.contraindications)]])}`,
+  remiss: d => `<h2>Remiss</h2>${dl([['Till', ed(d.to, d.evidence)], ['Frågeställning', ed(d.question)], ['Anamnes', ed(d.anamnesis)], ['Status', ed(d.status)], ['Pågående behandling', ed(d.current_treatment)], ['Brådska', urg(d.urgency)]])}`,
+  uppfoljning: d => `<h2>Uppföljning</h2><p class="small muted">Åtgärdslista till vårdadministratören.</p>${d.actions.length ? `<ul class="items todo">${d.actions.map(a => `<li><label><input type="checkbox"> ${ed(a.what, a.evidence)}</label><span class="small muted">${esc(a.when)} · ${esc(a.who)}</span></li>`).join('')}</ul>` : '<p class="muted">Ingen uppföljning bestämdes.</p>'}`,
+  patientinfo: d => `<h2>Till patienten via 1177</h2><p class="patient">${ed(d.summary)}</p>
+    ${[['Egenvård', d.self_care], ['Sök vård igen om', d.warning_signs], ['Nästa steg', d.next_steps]].filter(([, l]) => l.length).map(([h, l]) => `<h3>${h}</h3><ul class="items">${l.map(x => `<li>${ed(x)}</li>`).join('')}</ul>`).join('')}
+    <p class="small muted">Skicka via 1177 är inte inkopplat i demon.</p>`,
+};
+
 /* ---------- documents ---------- */
 const refs = ids => ids.length ? `<sup>${ids.join(' ')}</sup>` : '<sup class="bad">ingen källa</sup>';
 const claimSpan = (text, ids, level = 'ok') => `<span class="claim ${level}" data-ev="${ids.join(',')}" contenteditable>${esc(text)}</span>${refs(ids)} `;
 const journalHtml = j => `<h2>Journalanteckning</h2>${j.sections.map(sec => `<h3>${esc(sec.heading)}</h3><p>${sec.claims.map(c => claimSpan(c.text, c.evidence)).join('')}</p>`).join('')}`;
-const arbHtml = a => `<h2>Intyg om arbetsförmåga till arbetsgivare</h2>
-  <p class="small muted">Innehåller ingen diagnos. Arbetsgivaren har inte rätt till medicinska uppgifter.</p>
+const arbHtml = a => `<p class="eyebrow">Sjuklöneperioden · dag 8-14</p><h2>Läkarintyg om arbetsförmåga</h2>
+  <p class="small muted">Blankett AG 1-14 till arbetsgivaren. Dag 1-7 räcker patientens egen sjukanmälan; från dag 8 kan arbetsgivaren kräva läkarintyg. Innehåller ingen diagnos: arbetsgivaren har inte rätt till medicinska uppgifter.</p>
   <dl class="fk"><dt>Arbetsförmåga</dt><dd>${a.work_capacity_reduced ? `Nedsatt med ${a.degree} % i ${a.days} dagar` : 'Inte nedsatt'}</dd>
-  <dt>Hur den påverkas</dt><dd>${a.description.map(c => claimSpan(c.text, c.evidence)).join('') || '<em class="bad">Saknas</em>'}</dd>
-  <dt>Anpassningar</dt><dd>${a.adjustments.map(c => claimSpan(c.text, c.evidence)).join('') || '<span class="muted">Inga diskuterade</span>'}</dd></dl>`;
+  ${a.occupation ? `<dt>Sysselsättning</dt><dd>${esc(a.occupation)}</dd>` : ''}
+  <dt>Hur den påverkas</dt><dd data-arb="description">${a.description.map(c => claimSpan(c.text, c.evidence)).join('') || '<em class="bad">Saknas</em>'}</dd>
+  <dt>Arbetsförmåga trots sjukdom</dt><dd data-arb="adjustments">${a.adjustments.map(c => claimSpan(c.text, c.evidence)).join('') || '<span class="muted">Inga diskuterade</span>'}</dd></dl>`;
 
 function fkHtml({ cert: c, checks: k }) {
   const claims = sec => c[sec].length ? c[sec].map((x, i) => claimSpan(x.text, x.evidence, k.support[`${sec}.${i}`]?.level)).join('') : '<em class="bad">Saknas</em>';
@@ -402,7 +435,7 @@ function fkHtml({ cert: c, checks: k }) {
   const color = k.score >= 80 ? 'ok' : k.score >= 50 ? 'warn' : 'bad';
   const DFA = { diagnosis: 'D · Diagnos', function_impairment: 'F · Funktion', activity_limitation: 'A · Aktivitet', chain: 'Kedjan' };
   return `
-    <div class="fkhead"><h2>Läkarintyg för sjukpenning (FK 7804)</h2><div class="score ${color}">${k.score}<small>/100</small></div></div>
+    <p class="eyebrow">Sjukpenning · från dag 15</p><div class="fkhead"><div><h2>Läkarintyg för sjukpenning</h2><p class="small muted">Samma bedömning fyller två blanketter: FK 7804 till Försäkringskassan och AG 7804 till arbetsgivaren (utan diagnos).</p></div><div class="score ${color}">${k.score}<small>/100</small></div></div>
     <div class="dfa-row">${Object.entries(DFA).map(([key, l]) => `<div class="dfa ${c.dfa[key].status}" title="${esc(c.dfa[key].reason)}">${l}</div>`).join('')}</div>
     <dl class="fk">
       <dt>Diagnos</dt><dd data-field="diagnosis">${claimSpan(`${c.diagnosis.icd10} ${c.diagnosis.text}`, c.diagnosis.evidence)}</dd>
@@ -428,7 +461,8 @@ const prognosisText = p => (p ? PROGNOSIS[p.option]?.(p) || '' : '');
 const isoDate = d => new Date(d).toLocaleDateString('sv-SE');
 
 // Collect the (possibly edited) certificate text from the page and download the filled FK 7804.
-async function downloadPdf(r) {
+async function downloadPdf(r, formId) {
+  if (formId === 'ag114') return downloadAg114(r);
   const c = r.docs.fk.data.cert;
   const field = name => {
     const dd = document.querySelector(`dd[data-field="${name}"]`); if (!dd) return '';
@@ -445,15 +479,27 @@ async function downloadPdf(r) {
     prognosis_option: c.prognosis?.option, prognosis_months: c.prognosis?.months, prognosis_reason: c.prognosis?.reason,
     work_measures: field('work_measures'), other: '',
   };
-  const res = await fetch('/api/pdf', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  return savePdf(formId, body, r);
+}
+function downloadAg114(r) {
+  const a = r.docs.arb.data, patient = PATIENTS.find(p => p.id === r.patient);
+  const text = cls => [...document.querySelectorAll(`[data-arb="${cls}"] .claim`)].map(x => x.textContent.trim()).join(' ');
+  return savePdf('ag114', {
+    patient: patient ? patient.name : 'Ny patient', personnummer: 'ÅÅÅÅMMDD-XXXX (demo)', date: isoDate(r.createdAt),
+    occupation: a.occupation, description: text('description'), capacity_despite: text('adjustments'),
+    degree: a.work_capacity_reduced ? a.degree : '', from: isoDate(Date.now()), to: isoDate(Date.now() + (Math.max(1, a.days) - 1) * 864e5),
+  }, r);
+}
+async function savePdf(formId, body, r) {
+  const res = await fetch(`/api/pdf/${formId}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
   if (!res.ok) return alert('Kunde inte skapa PDF');
   const url = URL.createObjectURL(await res.blob());
-  Object.assign(document.createElement('a'), { href: url, download: `FK7804-utkast-${r.id}.pdf` }).click();
+  Object.assign(document.createElement('a'), { href: url, download: `${formId.toUpperCase()}-utkast-${r.id}.pdf` }).click();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 document.addEventListener('click', e => {
-  if (e.target.id !== 'pdfBtn') return;
-  const r = recordings.find(onDetail); if (r) downloadPdf(r);
+  const b = e.target.closest('[data-pdf]'); if (!b) return;
+  const r = recordings.find(onDetail); if (r) downloadPdf(r, b.dataset.pdf);
 });
 
 /* ---------- patients & settings ---------- */
@@ -470,7 +516,7 @@ async function renderSettings() {
   $('#view').innerHTML = `<div class="page"><h1>Inställningar</h1>
     <div class="card srow"><div><b>Claude API</b><div class="muted small">Nyckeln läses från <code>.env</code> på servern och skickas aldrig till webbläsaren.</div></div><span id="apiStatus" class="pill">Kontrollerar…</span></div>
     <div class="card srow"><div><b>Synk</b><div class="muted small">Inspelningar, ljud och dokument sparas på servern och uppdateras live på alla inloggade enheter.</div></div><span class="pill ${online ? 'ok' : 'bad'}">${online ? 'Ansluten' : 'Offline'}</span></div>
-    <div class="card srow"><div><b>Taligenkänning</b><div class="muted small">Webbläsarens svenska taligenkänning (Chrome skickar ljudet till Google, endast demo).</div></div><span class="pill ${hasSR ? 'ok' : 'bad'}">${hasSR ? 'Tillgänglig' : 'Stöds inte'}</span></div>
+    <div class="card srow"><div><b>Taligenkänning</b><div class="muted small">Soniox transkriberar inspelningen på servern: tider och säkerhet per ord, talarseparering och flera språk i samma samtal. Fungerar i alla webbläsare. Webbläsarens taligenkänning används för livetexten${hasSR ? '' : ' (stöds inte här)'} och som reserv.</div></div><span class="pill" id="sttStatus">Kontrollerar…</span></div>
     <div class="card srow"><div><b>Ljudlagring</b><div class="muted small">Ljudet sparas så att läkaren kan lyssna om transkriptet ser fel ut, och raderas automatiskt ${retentionDays} dagar efter signering. Bara texten sparas långsiktigt.</div></div><span class="pill">Signering + ${retentionDays} dagar</span></div>
     <div class="card srow"><div><b>Vim-läge</b><div class="muted small">Redigera journalanteckningar med Vim-kommandon (i, Esc, dd, :w, :q). Sparas på den här enheten.</div></div>
       <label class="switch"><input type="checkbox" id="vimToggle" ${vimOn() ? 'checked' : ''}><span></span></label></div>
@@ -484,6 +530,8 @@ async function renderSettings() {
     const s = await (await fetch('/api/status')).json();
     $('#apiStatus').textContent = s.keyConfigured ? 'Ansluten' : 'Nyckel saknas';
     $('#apiStatus').className = 'pill ' + (s.keyConfigured ? 'ok' : 'bad');
+    $('#sttStatus').textContent = s.soniox ? 'Soniox' : hasSR ? 'Endast webbläsaren' : 'Saknas';
+    $('#sttStatus').className = 'pill ' + (s.soniox ? 'ok' : hasSR ? 'warn' : 'bad');
   } catch { $('#apiStatus').textContent = 'Servern svarar inte'; $('#apiStatus').className = 'pill bad'; }
 }
 

@@ -7,8 +7,9 @@ import Anthropic from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
 import { z } from 'zod';
 import { runChecks } from './rules.mjs';
-import { buildFk7804 } from './pdf.mjs';
+import { buildFk7804, buildAg114, buildAg7804 } from './pdf.mjs';
 import { init, createApi } from './store.mjs';
+import { sonioxConfigured } from './soniox.mjs';
 
 try { process.loadEnvFile(); } catch {} // optional .env with ANTHROPIC_API_KEY
 const KEY_OK = /^sk-ant-[A-Za-z0-9_-]{20,}/.test(process.env.ANTHROPIC_API_KEY || '');
@@ -114,13 +115,47 @@ const Journal = z.object({
     .describe('Swedish journal note with the headings Kontaktorsak, Anamnes, Status, Bedömning, Åtgärd (skip a heading only if nothing was said about it)'),
 });
 const Arb = z.object({
+  occupation: z.string().describe('Occupation and work tasks as stated in the conversation, else empty string'),
   work_capacity_reduced: z.boolean(),
   degree: z.enum(['25', '50', '75', '100', '0']),
   days: z.number().int(),
   description: z.array(Claim).describe('How work capacity is reduced in relation to the job - WITHOUT diagnosis or medical details (employer must not get the diagnosis)'),
   adjustments: z.array(Claim).describe('Possible adjustments at work that could enable partial work, only if discussed'),
 });
+// Clinical after-work drafts (doctor picks which ones). Every item cites transcript lines (evidence).
+const Ev = z.array(z.string()).describe('IDs of transcript lines that support this item');
+const Recept = z.object({
+  prescriptions: z.array(z.object({ drug: z.string(), strength: z.string(), form: z.string().describe('e.g. tablett'), dosage: z.string(), amount: z.string().describe('pack size / quantity'),
+    duration: z.string(), indication: z.string(), evidence: Ev })).describe('Only drugs the doctor said they will prescribe'),
+  warnings: z.array(z.string()).describe('Missing or unclear info the doctor must fill in (e.g. dose not stated), mentioned allergies/interactions'),
+});
+const Lab = z.object({
+  tests: z.array(z.object({ name: z.string().describe('e.g. Blodstatus, CRP, HbA1c'), reason: z.string(), evidence: Ev })),
+  question: z.string().describe('Frågeställning'), urgency: z.enum(['rutin', 'brådskande', 'akut']), fasting: z.boolean(),
+});
+const Rtg = z.object({
+  exam: z.string().describe('e.g. Slätröntgen höger axel, MR ländrygg'), question: z.string(), anamnesis: z.string(), status: z.string(),
+  urgency: z.enum(['rutin', 'brådskande', 'akut']), contraindications: z.string().describe('Relevant for MR/contrast (pacemaker, pregnancy, kidney function), or "Inga kända"'), evidence: Ev,
+});
+const Remiss = z.object({
+  to: z.string().describe('Receiving unit, e.g. Fysioterapeut, Ortopedmottagning'), question: z.string(), anamnesis: z.string(), status: z.string(),
+  current_treatment: z.string(), urgency: z.enum(['rutin', 'brådskande', 'akut']), evidence: Ev,
+});
+const Followup = z.object({
+  actions: z.array(z.object({ what: z.string(), when: z.string().describe('e.g. om 2 veckor, 2026-12-04'), who: z.enum(['läkare', 'sjuksköterska', 'fysioterapeut', 'vårdadministratör', 'patienten']), evidence: Ev })),
+});
+const PatientInfo = z.object({
+  summary: z.string().describe('What happened at the visit, plain Swedish for the patient, 2-4 sentences'),
+  self_care: z.array(z.string()), warning_signs: z.array(z.string()).describe('When to seek care again / call 1177 / 112'), next_steps: z.array(z.string()),
+});
+const AFTER = 'Skriv ett utkast som läkaren granskar. Ta bara med det som faktiskt sades eller beslutades i samtalet; föreslå inget nytt. Saknas något som behövs, lämna fältet tomt och nämn det.';
 const DOCS = {
+  recept: { schema: Recept, system: `Du skriver receptutkast för läkare i svensk primärvård utifrån ett transkriberat besök. ${AFTER} ${GROUNDING}` },
+  lab: { schema: Lab, system: `Du skriver labbremiss för läkare i svensk primärvård utifrån ett transkriberat besök. ${AFTER} ${GROUNDING}` },
+  rtg: { schema: Rtg, system: `Du skriver röntgenremiss (bild- och funktionsmedicin) för läkare i svensk primärvård utifrån ett transkriberat besök. ${AFTER} ${GROUNDING}` },
+  remiss: { schema: Remiss, system: `Du skriver remiss till specialistvård eller rehabilitering för läkare i svensk primärvård utifrån ett transkriberat besök. ${AFTER} ${GROUNDING}` },
+  uppfoljning: { schema: Followup, system: `Du skriver en åtgärdslista för uppföljning och bokning till vårdadministratören utifrån ett transkriberat besök. ${AFTER} ${GROUNDING}` },
+  patientinfo: { schema: PatientInfo, system: `Du skriver ett meddelande till patienten via 1177 på enkel, vänlig svenska utifrån ett transkriberat besök. ${AFTER} ${GROUNDING}` },
   journal: { schema: Journal, system: 'Du skriver ett utkast till journalanteckning för läkare i svensk primärvård utifrån ett transkriberat besök. Kort, sakligt journalspråk. ' + GROUNDING },
   arb: { schema: Arb, system: 'Du skriver ett utkast till läkarintyg om arbetsförmåga till arbetsgivare (sjuklöneperioden). Arbetsgivaren får INTE veta diagnos eller medicinska detaljer. Beskriv bara hur arbetsförmågan påverkas i relation till arbetet. ' + GROUNDING },
 };
@@ -146,14 +181,15 @@ if (!process.env.NO_SERVER) http.createServer(async (req, res) => {
   try {
     if (req.url === '/api/status') {
       res.writeHead(200, { 'content-type': 'application/json' });
-      return res.end(JSON.stringify({ keyConfigured: KEY_OK }));
+      return res.end(JSON.stringify({ keyConfigured: KEY_OK, soniox: sonioxConfigured() }));
     }
     if (await api(req, res)) return;
-    if (req.method === 'POST' && req.url === '/api/pdf') {
+    const pdfForm = { '/api/pdf': buildFk7804, '/api/pdf/fk7804': buildFk7804, '/api/pdf/ag114': buildAg114, '/api/pdf/ag7804': buildAg7804 }[req.url];
+    if (req.method === 'POST' && pdfForm) {
       let body = '';
       for await (const c of req) body += c;
-      const pdf = await buildFk7804(JSON.parse(body));
-      res.writeHead(200, { 'content-type': 'application/pdf', 'content-disposition': 'attachment; filename="FK7804-utkast.pdf"' });
+      const pdf = await pdfForm(JSON.parse(body));
+      res.writeHead(200, { 'content-type': 'application/pdf', 'content-disposition': 'attachment; filename="intyg-utkast.pdf"' });
       return res.end(Buffer.from(pdf));
     }
     const route = { '/api/process': processTranscript, '/api/journal': b => generateDoc('journal', b), '/api/arb': b => generateDoc('arb', b) }[req.url];

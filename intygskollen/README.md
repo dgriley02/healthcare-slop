@@ -5,7 +5,7 @@ Records a doctor-patient consultation, transcribes it, and drafts the journal no
 ## Run
 
     npm install
-    cp .env.example .env     # add ANTHROPIC_API_KEY, optionally ACCESS_PASSWORD
+    cp .env.example .env     # add ANTHROPIC_API_KEY, SONIOX_API_KEY (optional), ACCESS_PASSWORD (optional)
     npm start                # http://localhost:3000
     ./tunnel.sh              # optional: public HTTPS URL (written to tunnel-url.txt), needs cloudflared
 
@@ -31,8 +31,21 @@ Records a doctor-patient consultation, transcribes it, and drafts the journal no
   - Vim editing of the journal note.
   - "Send via Webcert" is simulated in the demo.
 
+## Also included
+
+- **Soniox** (`soniox.mjs`): if `SONIOX_API_KEY` is set, the uploaded audio is transcribed with stt-async-v6, which gives:
+  - per-word timestamps and confidence
+  - speaker diarization
+  - several languages in the same conversation
+  - support for any browser
+
+  Audio and transcript are deleted at Soniox right after transcription.
+- **Forms**: FK 7804 (Försäkringskassan), AG 1-14 (employer, sick-pay period days 8-14) and AG 7804 (employer, from day 15), filled from the drafts.
+- **After-work cards** chosen by the doctor: prescription, lab request, X-ray request, referral, follow-up list and patient information. Every item cites the transcript.
+- **Example conversations** in `public/samples.js` cover the cards and their combinations. They are added to the database on start.
+
 ## Limitations
 
-- In Chrome, speech recognition sends audio to Google, so use role-played conversations only.
+- Without Soniox, transcription uses the browser (Chrome sends audio to Google). Use role-played conversations only.
 - The recommended sick-leave lengths are demo values; replace them with Socialstyrelsen's försäkringsmedicinskt beslutsstöd.
 - There is no real Webcert integration.

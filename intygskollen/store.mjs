@@ -4,6 +4,7 @@
 import { readFile, writeFile, mkdir, unlink, stat } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import vm from 'node:vm';
+import { transcribe, sonioxConfigured } from './soniox.mjs';
 
 const DIR = new URL('./data/', import.meta.url);
 const AUDIO = new URL('./audio/', DIR);
@@ -23,14 +24,15 @@ const exampleConfidence = text => text.split(' ').map((w, i) => {
   const h = hash(w + i) % 100;
   return { w, c: h < 6 ? 0.45 + h / 20 : h < 16 ? 0.7 + (h - 6) / 100 : 0.9 + (h % 10) / 100 };
 });
-async function seedExamples() {
+async function seedExamples() { // adds any example conversation that is not in the database yet
   const ctx = { window: {} };
   vm.runInNewContext(await readFile(new URL('./public/samples.js', import.meta.url), 'utf8'), ctx);
   const { SAMPLES, SUMMARIES } = ctx.window, names = Object.keys(SAMPLES);
   names.forEach((name, i) => {
-    const duration = 240 + i * 95, lines = SAMPLES[name], per = duration / lines.length;
+    if (db.recordings.some(r => r.example && r.exampleKey === name)) return;
+    const lines = SAMPLES[name], duration = lines.length * 22, per = duration / lines.length;
     db.recordings.push({
-      id: 'R' + db.nextId++, title: name, patient: 'P' + (i + 1), example: true, createdAt: new Date(Date.now() - (names.length - i) * 5 * 36e5).toISOString(), duration,
+      id: 'R' + db.nextId++, title: name, exampleKey: name, patient: 'P' + (i + 1), example: true, createdAt: new Date(Date.now() - (names.length - i) * 5 * 36e5).toISOString(), duration,
       bars: Array.from({ length: Math.round(duration / 0.06 / 4) }, (_, k) => +(0.12 + Math.abs(Math.sin(k / 3)) * 0.45 * Math.random() + Math.random() * 0.15).toFixed(2)),
       transcript: lines.map((u, k) => ({ id: 'U' + (k + 1), speaker: u.speaker, text: u.text, start: k * per, words: exampleConfidence(u.text) })),
       summary: SUMMARIES[name], docs: {},
@@ -40,7 +42,12 @@ async function seedExamples() {
 
 export async function init() {
   await mkdir(AUDIO, { recursive: true });
-  try { Object.assign(db, JSON.parse(await readFile(DB, 'utf8'))); } catch { await seedExamples(); save(); }
+  try { Object.assign(db, JSON.parse(await readFile(DB, 'utf8'))); } catch {}
+  for (const r of db.recordings) if (r.example) {
+    r.exampleKey ??= r.title; // older databases
+    if (/engelska/i.test(r.exampleKey)) r.lang ??= 'sv+en'; // mixed-language example
+  }
+  await seedExamples(); save();
   for (const r of db.recordings) { // generation interrupted by a restart: let the user retry
     r.processing = false;
     for (const d of Object.values(r.docs)) if (d.loading) { d.loading = false; d.error ??= 'Avbröts när servern startades om'; }
@@ -62,12 +69,14 @@ const body = async req => { const c = []; for await (const x of req) c.push(x); 
 const fail = (status, msg) => Object.assign(new Error(msg), { status });
 const plain = transcript => transcript.map(({ id, speaker, text }) => ({ id, speaker, text }));
 const journalText = r => r.docs.journal?.data?.sections.map(s => `${s.heading}: ${s.claims.map(c => c.text).join(' ')}`).join('\n') || '';
-const NEEDS = { journal: null, fk: 'journal', arb: 'journal' };
+const browserLines = segs => segs.map((x, i) => ({ id: 'U' + (i + 1), speaker: '?', text: x.text.trim(), start: x.start, words: x.text.trim().split(/\s+/).map(w => ({ w, c: x.conf })) }));
+const NEEDS = { journal: null, fk: 'journal', arb: 'journal', recept: null, lab: null, rtg: null, remiss: null, uppfoljning: null, patientinfo: null };
 
 export function createApi({ analyze, generateDoc, processTranscript }) {
   async function runProcess(r) {
     try {
-      const p = await processTranscript({ transcript: plain(r.transcript), lang: r.lang });
+      // Soniox diarization gives each line a voice number; it helps Claude tell doctor from patient.
+      const p = await processTranscript({ transcript: r.transcript.map(u => ({ id: u.id, speaker: '?', text: u.voice ? `[röst ${u.voice}] ${u.text}` : u.text })), lang: r.lang });
       const norm = w => w.toLowerCase().replace(/[^a-zåäö0-9]/g, '');
       for (const seg of p.segments) {
         const u = r.transcript.find(x => x.id === seg.id); if (!u) continue;
@@ -146,12 +155,31 @@ export function createApi({ analyze, generateDoc, processTranscript }) {
       const { segments = [], srError, noSpeechRecognition, lang } = JSON.parse(await body(req));
       if (lang) r.lang = String(lang).slice(0, 20);
       const segs = segments.filter(x => x.text?.trim());
+      if (sonioxConfigured() && r.audio) { // accurate server-side transcription; browser text was only a live preview
+        r.stt = 'soniox'; changed();
+        (async () => {
+          try {
+            const lines = await transcribe(await readFile(new URL(r.id, AUDIO)), r.audioType, r.lang);
+            const langs = [...new Set(lines.flatMap(l => (l.lang || '').split('+')).filter(Boolean))];
+            if (langs.length) r.lang = langs.join('+');
+            if (lines.length) { r.transcript = lines; changed(); return runProcess(r); }
+            r.note = 'Inget tal uppfattades.'; r.title = 'Ingen text';
+          } catch (e) {
+            r.note = `${e.message}. Visar webbläsarens transkribering i stället.`;
+            r.stt = 'browser';
+            if (segs.length) { r.transcript = browserLines(segs); changed(); return runProcess(r); }
+          }
+          r.processing = false; changed();
+        })();
+        return json(res, 202, {}), true;
+      }
+      r.stt = 'browser';
       if (!segs.length) {
         r.processing = false; r.title = 'Ingen text';
         r.note = noSpeechRecognition ? 'Taligenkänning stöds inte i webbläsaren som spelade in. Använd Chrome.' : `Inget tal uppfattades${srError ? ` (${srError})` : ''}.`;
         changed();
       } else {
-        r.transcript = segs.map((x, i) => ({ id: 'U' + (i + 1), speaker: '?', text: x.text.trim(), start: x.start, words: x.text.trim().split(/\s+/).map(w => ({ w, c: x.conf })) }));
+        r.transcript = browserLines(segs);
         changed(); runProcess(r);
       }
       return json(res, 202, {}), true;
