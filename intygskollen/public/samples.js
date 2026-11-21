@@ -291,3 +291,33 @@ Object.assign(window.SAMPLES, {
     L('Anhörig', 'Det vore jättebra, tack.'),
   ],
 });
+
+// DEMO: the first visit for the live demo (patient Michael Brown, P27, English-speaking, with an interpreter), dated 12 days back.
+// It holds everything FK 7804 needs (occupation and tasks, diagnosis, measured findings, activity limitations tied to the job,
+// treatment, sick-leave period), so a 40-second follow-up visit recorded live can produce a valid extended certificate.
+const DEMO_KEY = 'Demo: Michael, första besöket (ryggskott, tolk)';
+window.SAMPLE_META = Object.assign(window.SAMPLE_META || {}, { [DEMO_KEY]: { patient: 'P27', daysAgo: 12 } });
+window.SAMPLE_LANGS = Object.assign(window.SAMPLE_LANGS || {}, { [DEMO_KEY]: 'sv+en' });
+Object.assign(window.SUMMARIES, {
+  [DEMO_KEY]: 'Engelsktalande undersköterska, besök med tolk. Lyfte en brukare i förrgår. Akut lumbago med ischias vänster: Lasègue positiv vänster vid 40 grader, framåtböjning till knäna, normal kraft och reflexer. Ibuprofen, remiss fysioterapeut, sjukskriven 100 % i tolv dagar.',
+});
+Object.assign(window.SAMPLES, {
+  [DEMO_KEY]: [
+    L('Läkare', 'Hej Michael, vad har hänt?'),
+    L('Tolk', 'Hi Michael, what happened?'),
+    L('Patient', 'I hurt my lower back two days ago when I lifted a resident at work. Since then the pain shoots down my left leg.'),
+    L('Tolk', 'Han fick ont i ländryggen i förrgår när han lyfte en brukare på jobbet. Sedan dess strålar smärtan ner i vänster ben.'),
+    L('Läkare', 'Vad jobbar du med?'),
+    L('Tolk', 'What is your job?'),
+    L('Patient', 'I work full time as an assistant nurse at a care home. I help the residents move, I shower them, make beds and lift a lot all day.'),
+    L('Tolk', 'Han är undersköterska på ett äldreboende, heltid. Han hjälper brukarna att förflytta sig, duschar dem, bäddar sängar och lyfter mycket hela dagarna.'),
+    L('Patient', 'I cannot bend forward, I cannot sit for more than fifteen minutes, and this morning I could not put on my socks.'),
+    L('Tolk', 'Han kan inte böja sig framåt, kan inte sitta mer än en kvart och kunde inte ta på sig strumporna i morse.'),
+    L('Läkare', 'Jag undersöker dig. Framåtböjningen är kraftigt nedsatt, fingertopparna når till knäna. Lasègue är positiv vänster vid 40 grader. Kraft, reflexer och känsel i benen är normala.'),
+    L('Läkare', 'Det här är en akut lumbago med ischiassmärta. Med de fynden kan du inte förflytta brukare, lyfta eller hjälpa till i duschen, och du kan inte sitta längre stunder.'),
+    L('Tolk', 'This is acute low back pain with sciatica. With these findings you cannot move residents, lift or help with showering, and you cannot sit for long.'),
+    L('Läkare', 'Du får ibuprofen 400 milligram tre gånger om dagen i en vecka och en remiss till fysioterapeut. Jag sjukskriver dig på heltid i tolv dagar och vi ses innan den tar slut.'),
+    L('Tolk', 'You get ibuprofen 400 milligrams three times a day for a week and a referral to a physiotherapist. You are on full sick leave for twelve days, and you will come back before it ends.'),
+    L('Patient', 'Okay, thank you.'),
+  ],
+});

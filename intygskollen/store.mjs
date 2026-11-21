@@ -20,11 +20,12 @@ const PATIENT_SEED = [
   ['Erik Lund', 34], ['Sara Holm', 41], ['Amira Haddad', 52], ['Jonas Berg', 27], ['Birgitta Ek', 63], ['Ali Karimi', 38], ['Maja Lind', 31],
   ['Fatima Noor', 45], ['Karin Sjö', 49], ['Daniel Moore', 36], ['Layla Hassan', 29], ['Reza Ahmadi', 34], ['Hodan Ali', 41], ['Senait Tesfay', 37],
   ['Karwan Rashid', 44], ['Emir Hodžić', 58], ['Piotr Nowak', 39], ['Ayşe Yılmaz', 67], ['Olena Kovalenko', 33], ['Aino Virtanen', 71],
-  ['Erkki Niemi', 64], ['Ánne Sara', 26], ['Milan Kaldaras', 47], ['Rivka Goldberg', 82], ['Lars Persson', 55], ['Emma Nilsson', 23],
+  ['Erkki Niemi', 64], ['Ánne Sara', 26], ['Milan Kaldaras', 47], ['Rivka Goldberg', 82], ['Lars Persson', 55], ['Emma Nilsson', 23], ['Michael Brown', 38],
 ];
 function seedPatients() {
   PATIENT_SEED.forEach(([name, age], i) => {
-    const id = 'P' + (i + 1); if (db.patients.some(p => p.id === id)) return;
+    const id = 'P' + (i + 1), existing = db.patients.find(p => p.id === id);
+    if (existing) { Object.assign(existing, { name, age }); return; } // keep demo patients in line with the seed list
     const y = 2026 - age, m = String(1 + (i * 5) % 12).padStart(2, '0'), d = String(1 + (i * 7) % 28).padStart(2, '0');
     db.patients.push({ id, name, age, personnummer: `${y}${m}${d}-TF${String(i + 1).padStart(2, '0')}` });
   });
@@ -114,7 +115,7 @@ async function seedExamples() { // adds any example conversation that is not in 
   const ctx = { window: {} };
   for (const f of ['samples.js', 'samples-samelang.js']) // the second file overrides some examples
     vm.runInNewContext(await readFile(new URL(`./public/${f}`, import.meta.url), 'utf8').catch(() => ''), ctx);
-  const { SAMPLES, SUMMARIES, SAMPLE_LANGS = {} } = ctx.window, names = Object.keys(SAMPLES);
+  const { SAMPLES, SUMMARIES, SAMPLE_LANGS = {}, SAMPLE_META = {} } = ctx.window, names = Object.keys(SAMPLES);
   names.forEach((name, i) => {
     const existing = db.recordings.find(r => r.example && r.exampleKey === name);
     if (existing) { // example text changed (e.g. now fully in the patient's language): refresh it and drop drafts built on the old text
@@ -127,7 +128,8 @@ async function seedExamples() { // adds any example conversation that is not in 
     }
     const lines = SAMPLES[name], duration = lines.length * 22, per = duration / lines.length;
     db.recordings.push({
-      id: 'R' + db.nextId++, title: name, exampleKey: name, patient: 'P' + (i + 1), example: true, createdAt: new Date(Date.now() - (names.length - i) * 5 * 36e5).toISOString(), duration,
+      id: 'R' + db.nextId++, title: name, exampleKey: name, patient: SAMPLE_META[name]?.patient || 'P' + (i + 1), example: true, duration,
+      createdAt: new Date(Date.now() - (SAMPLE_META[name]?.daysAgo != null ? SAMPLE_META[name].daysAgo * 864e5 : (names.length - i) * 5 * 36e5)).toISOString(),
       bars: Array.from({ length: Math.round(duration / 0.06 / 4) }, (_, k) => +(0.12 + Math.abs(Math.sin(k / 3)) * 0.45 * Math.random() + Math.random() * 0.15).toFixed(2)),
       transcript: lines.map((u, k) => ({ id: 'U' + (k + 1), speaker: u.speaker, text: u.text, start: k * per, words: exampleConfidence(u.text) })),
       summary: SUMMARIES[name], docs: {}, lang: SAMPLE_LANGS[name],
@@ -142,6 +144,10 @@ export async function init() {
     r.exampleKey ??= r.title; // older databases
     if (/engelska/i.test(r.exampleKey)) r.lang ??= 'sv+en'; // mixed-language example
   }
+  // drop example meetings whose example no longer exists (e.g. renamed demo patient)
+  const ctx = { window: {} };
+  for (const f of ['samples.js', 'samples-samelang.js']) vm.runInNewContext(await readFile(new URL(`./public/${f}`, import.meta.url), 'utf8').catch(() => ''), ctx);
+  db.recordings = db.recordings.filter(r => !r.example || !r.exampleKey || ctx.window.SAMPLES?.[r.exampleKey]);
   await seedExamples(); seedPatients();
   db.session ??= { state: 'idle', version: 0 };
   if (db.session.state === 'recording' || db.session.state === 'uploading') db.session.state = 'ready'; // a restart interrupted it
@@ -194,13 +200,30 @@ function dispatch(d, { system, ref, steps }) {
   run.total = steps.length; changed();
 }
 const AUTO_MIN_SCORE = +(process.env.AUTO_MIN_SCORE || 70); // relevance needed for a card to be drafted automatically
+// Earlier meetings with the same patient, newest first, within a character budget: context for documents such as an
+// extended sick leave. Line ids are prefixed with the meeting id ("R72:U9") so they can be cited and checked.
+const PRIOR_BUDGET = +(process.env.PRIOR_CONTEXT_CHARS || 24000);
+function priorContext(r) {
+  if (!r.patient) return [];
+  const earlier = db.recordings.filter(x => x !== r && x.patient === r.patient && x.createdAt < r.createdAt && x.transcript.length)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const out = []; let used = 0;
+  for (const m of earlier) {
+    const header = `Besök ${m.id}, ${m.createdAt.slice(0, 10)}: ${m.title}`;
+    const lines = m.transcript.map(u => ({ id: `${m.id}:${u.id}`, speaker: u.speaker, speakerDetail: u.speakerDetail, text: u.text }));
+    const size = header.length + lines.reduce((n, u) => n + u.text.length + 30, 0);
+    if (used + size > PRIOR_BUDGET) break;
+    lines[0].header = header; out.push(...lines); used += size;
+  }
+  return out;
+}
 const NEEDS = { journal: null, fk: null, arb: null, recept: null, lab: null, rtg: null, remiss: null, uppfoljning: null, patientinfo: null };
 
 export function createApi({ analyze, generateDoc, processTranscript, rankCards }) {
   async function runRank(r) {
     if (r.relevance?.loading || !r.transcript.length) return;
     r.relevance = { loading: true }; changed();
-    try { r.relevance = await rankCards({ transcript: plain(r.transcript) }); }
+    try { r.relevance = await rankCards({ transcript: plain(r.transcript), prior: priorContext(r), today: r.createdAt.slice(0, 10) }); }
     catch (e) { r.relevance = { error: e.message }; }
     changed();
     autoGenerate(r);
@@ -247,7 +270,7 @@ export function createApi({ analyze, generateDoc, processTranscript, rankCards }
   async function runGenerate(r, kind) {
     r.docs[kind] = { loading: true }; changed();
     try {
-      const args = { transcript: plain(r.transcript), lang: r.lang, journal: kind === 'journal' ? undefined : journalText(r) };
+      const args = { transcript: plain(r.transcript), lang: r.lang, journal: kind === 'journal' ? undefined : journalText(r), prior: priorContext(r), today: r.createdAt.slice(0, 10) };
       const data = kind === 'fk' ? await analyze(args) : await generateDoc(kind, args);
       r.docs[kind] = { data, createdAt: new Date().toISOString() };
     } catch (e) { r.docs[kind] = { error: e.message }; }

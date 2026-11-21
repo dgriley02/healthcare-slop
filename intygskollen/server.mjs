@@ -83,14 +83,18 @@ async function llm(schema, system, user, opts = {}) {
 // House style: no en/em dashes in generated text.
 const noDashes = v => typeof v === 'string' ? v.replace(/\s+[–—]\s+/g, ', ').replace(/[–—]/g, '-')
   : Array.isArray(v) ? v.map(noDashes) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, noDashes(x)])) : v;
-const fmt = transcript => transcript.map(u => `${u.id} [${u.speaker}${u.speakerDetail ? `, ${u.speakerDetail}` : ''}]: ${u.text}`).join('\n');
+const fmt = transcript => transcript.map(u => `${u.header ? `\n${u.header}\n` : ''}${u.id} [${u.speaker}${u.speakerDetail ? `, ${u.speakerDetail}` : ''}]: ${u.text}`).join('\n');
 // Documents later in the flow (FK, employer) also get the doctor's journal note as context; evidence must still cite transcript lines.
 const withJournal = j => (j ? `\n\nJournalanteckning (granskad av läkaren, som sammanhang; evidence ska fortfarande vara transkriptets rad-ID:n):\n${j}` : '');
-const GROUNDING = 'Varje rad anger vem som talar (läkare, patient, sjuksköterska, anhörig, tolk m.fl.). Repliker från Övrig (personer utan del i vården) är inte medicinsk information. Det en anhörig eller annan person säger om patienten ska återges som deras uppgift, inte som patientens egen. Använd ENDAST information som finns i transkriptet. Hitta aldrig på fynd, mätvärden, diagnoser eller uppgifter. Varje mening ska ha evidence = ID:n för de rader som stöder den. Använd inte tankstreck (– eller —). Samtalet kan vara på ett annat språk än svenska; skriv ändå alltid dokumentet på svenska.';
+// Earlier meetings with the same patient (newest first, within a size budget) are context, e.g. for an extended sick leave:
+// their lines have ids like "R72:U9" and may be cited as evidence. Today's date lets the model count the sick period.
+const withPrior = prior => (prior.length ? `\n\nTidigare besök för samma patient (underlag; rad-ID:n som "R72:U9" får användas som evidence):\n${fmt(prior)}` : '');
+const withDate = today => (today ? `Dagens datum (detta besök): ${today}.\n` : '');
+const GROUNDING = 'Om tidigare besök finns med: använd dem som underlag (t.ex. diagnos, yrke, sjukperiodens början och tidigare fynd) men låt dagens besök gälla för nuvarande status. Vid förlängning av sjukskrivning: räkna sjukperioden från första sjukdagen. Varje rad anger vem som talar (läkare, patient, sjuksköterska, anhörig, tolk m.fl.). Repliker från Övrig (personer utan del i vården) är inte medicinsk information. Det en anhörig eller annan person säger om patienten ska återges som deras uppgift, inte som patientens egen. Använd ENDAST information som finns i transkriptet. Hitta aldrig på fynd, mätvärden, diagnoser eller uppgifter. Varje mening ska ha evidence = ID:n för de rader som stöder den. Använd inte tankstreck (– eller —). Samtalet kan vara på ett annat språk än svenska; skriv ändå alltid dokumentet på svenska.';
 
-export async function analyze({ transcript, journal, lang }, opts = {}) {
-  const { out: cert, usage } = await llm(Certificate, SYSTEM, `Transkript:\n${fmt(transcript)}${withJournal(journal)}\n\nSkriv utkastet.`, opts);
-  return { cert, checks: runChecks(cert, transcript, lang), usage };
+export async function analyze({ transcript, journal, lang, prior = [], today }, opts = {}) {
+  const { out: cert, usage } = await llm(Certificate, SYSTEM, `${withDate(today)}Transkript:\n${fmt(transcript)}${withJournal(journal)}${withPrior(prior)}\n\nSkriv utkastet.`, opts);
+  return { cert, checks: runChecks(cert, [...transcript, ...prior], lang), usage };
 }
 
 // After recording: label speakers, flag likely misrecognised words, summarise. Never rewrites the transcript.
@@ -170,16 +174,16 @@ const Relevance = z.object({
     reason: z.string().describe('Very short Swedish reason citing what was said, max 8 words, e.g. "Läkaren förskrev Kåvepenin"'),
   })).describe('Exactly one entry per kind'),
 });
-export async function rankCards({ transcript }) {
+export async function rankCards({ transcript, prior = [], today }) {
   const { out } = await llm(Relevance,
     `Du avgör vilka dokument en läkare i svensk primärvård behöver skapa efter ett besök. Typer: recept (läkemedel förskrevs), lab (prover beställdes), rtg (röntgen/MR/DT/ultraljud beställdes), remiss (remiss till annan vårdgivare, specialist, fysioterapeut, psykolog), uppfoljning (återbesök, telefonkontakt, bokningar), patientinfo (råd eller varningstecken gavs till patienten), arb (läkarintyg till arbetsgivaren för sjukskrivning dag 8-14), fk (sjukskrivning längre än 14 dagar: FK 7804 och AG 7804). Räkna sjukperioden från första sjukdagen som nämns i samtalet, inte från besöket. Sjukperiod upp till 7 dagar kräver inget intyg. Om perioden når dag 8-14 behövs arb. Om den passerar dag 14 behövs fk, och även arb om dag 8-14 ingår. Bedöm bara utifrån samtalet. ${GROUNDING}`,
-    `Transkript:\n${fmt(transcript)}`, { effort: 'low' });
+    `${withDate(today)}Transkript:\n${fmt(transcript)}${withPrior(prior)}`, { effort: 'low' });
   return out;
 }
 
-export async function generateDoc(kind, { transcript, journal }) {
+export async function generateDoc(kind, { transcript, journal, prior = [], today }) {
   const d = DOCS[kind];
-  const { out } = await llm(d.schema, d.system, `Transkript:\n${fmt(transcript)}${withJournal(journal)}`);
+  const { out } = await llm(d.schema, d.system, `${withDate(today)}Transkript:\n${fmt(transcript)}${withJournal(journal)}${withPrior(prior)}`);
   return out;
 }
 
