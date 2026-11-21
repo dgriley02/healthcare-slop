@@ -1,0 +1,185 @@
+// Intygskollen: drafts an FK 7804 sick-pay certificate from a consultation transcript
+// and checks it against Försäkringskassan's DFA-chain requirements.
+import http from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { extname, join } from 'node:path';
+import Anthropic from '@anthropic-ai/sdk';
+import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
+import { z } from 'zod';
+import { runChecks } from './rules.mjs';
+import { buildFk7804 } from './pdf.mjs';
+import { init, createApi } from './store.mjs';
+
+try { process.loadEnvFile(); } catch {} // optional .env with ANTHROPIC_API_KEY
+const KEY_OK = /^sk-ant-[A-Za-z0-9_-]{20,}/.test(process.env.ANTHROPIC_API_KEY || '');
+const client = KEY_OK ? new Anthropic({ maxRetries: 4 }) : null; // extra retries: venue wifi drops connections
+const ACCESS_PASSWORD = process.env.ACCESS_PASSWORD || '';
+const MODEL = process.env.MODEL || 'claude-opus-5-5';
+const EFFORT = process.env.EFFORT || 'low';
+const SPEED = process.env.SPEED ?? 'fast'; // Opus 5.5 fast mode: ~5 s instead of ~15 s, 2x token price
+if (!KEY_OK) console.warn('ANTHROPIC_API_KEY saknas. Lägg in den i .env och starta om.');
+const PORT = process.env.PORT || 3000;
+
+const Claim = z.object({
+  text: z.string().describe('One sentence in Swedish clinical certificate language'),
+  evidence: z.array(z.string()).describe('IDs of the transcript lines (e.g. "U4") that support this sentence'),
+});
+const Check = z.object({
+  status: z.enum(['ok', 'warn', 'missing']),
+  reason: z.string().describe('Short Swedish explanation for the doctor'),
+});
+const Certificate = z.object({
+  diagnosis: z.object({ icd10: z.string(), text: z.string(), evidence: z.array(z.string()) }),
+  occupation: z.object({ text: z.string(), evidence: z.array(z.string()) }),
+  function_impairment: z.array(Claim),
+  activity_limitation: z.array(Claim),
+  treatment: z.array(Claim),
+  sick_leave: z.object({ degree: z.enum(['25', '50', '75', '100']), days: z.number().int(), evidence: z.array(z.string()) }),
+  prognosis: z.object({
+    option: z.enum(['full_after_end', 'full_after_months', 'not_full', 'uncertain']),
+    months: z.number().int().describe('Only for full_after_months, else 0'),
+    reason: z.string().describe('Basis for the assessment if uncertain, else empty string'),
+  }).describe('FK 7804 question 9: prognosis for return to current occupation'),
+  work_measures: z.string().describe('FK 7804 question 10: non-healthcare measures that could help return to work, only if discussed, else empty string'),
+  motivation_longer_leave: z.string().describe('Justification if sick leave is longer than usual, else empty string'),
+  dfa: z.object({ diagnosis: Check, function_impairment: Check, activity_limitation: Check, chain: Check }),
+  questions_to_ask: z.array(z.string()).describe('Questions the doctor should ask before the patient leaves, to close gaps FK would request completion for'),
+  patient_summary: z.string().describe('2-4 sentences in plain Swedish for the patient: what happens next with FK'),
+});
+
+const SYSTEM = `Du är ett dokumentationsstöd för läkare i svensk primärvård. Du skriver ett UTKAST till Försäkringskassans "Läkarintyg för sjukpenning" (FK 7804) utifrån ett transkriberat patientbesök. Läkaren granskar, redigerar och signerar. Du beslutar ingenting.
+
+Regler:
+- Använd ENDAST information som finns i transkriptet. Hitta aldrig på fynd, mätvärden, diagnoser eller arbetsuppgifter. Saknas något: lämna fältet tomt och flagga det.
+- Varje mening ska ha evidence = ID:n för de rader i transkriptet som stöder den.
+- Följ DFA-kedjan: Diagnos -> Funktionsnedsättning (observerade fynd, helst grader/mått/testresultat, inte bara patientens upplevelse) -> Aktivitetsbegränsning (konkret vad patienten inte kan göra, kopplat till patientens faktiska arbetsuppgifter). Varje led ska rimligen följa av föregående.
+- Bedöm varje led i "dfa" strikt, så som en handläggare på Försäkringskassan skulle göra. Vanligaste orsaken till kompletteringsbegäran är otydlig aktivitetsbegränsning, därefter otydlig funktionsnedsättning.
+- questions_to_ask: konkreta frågor/undersökningar läkaren kan göra innan patienten går, för att täppa till luckorna.`;
+
+// One structured-output call to Claude, with automatic fallback from fast mode to standard speed.
+async function llm(schema, system, user, opts = {}) {
+  if (!client) throw Object.assign(new Error('API-nyckel saknas. Lägg in ANTHROPIC_API_KEY i .env och starta om servern.'), { status: 503 });
+  const call = speed => client.messages.parse({
+    model: opts.model || MODEL,
+    ...(speed === 'fast' ? { speed: 'fast' } : {}),
+    max_tokens: 16000,
+    output_config: { effort: opts.effort || EFFORT, format: zodOutputFormat(schema) },
+    system,
+    messages: [{ role: 'user', content: user }],
+  });
+  const speed = opts.speed ?? SPEED;
+  let msg;
+  try { msg = await call(speed); }
+  catch (e) {
+    if (speed !== 'fast' || !(e instanceof Anthropic.APIError) || ![400, 429, 529].includes(e.status)) throw e;
+    console.warn(`Fast mode unavailable (${e.status}), retrying at standard speed`);
+    msg = await call('');
+  }
+  if (msg.stop_reason === 'refusal') throw Object.assign(new Error('Modellen avböjde förfrågan'), { status: 422 });
+  if (msg.stop_reason === 'max_tokens') throw Object.assign(new Error('Svaret blev för långt'), { status: 502 });
+  return { out: noDashes(msg.parsed_output), usage: msg.usage };
+}
+// House style: no en/em dashes in generated text.
+const noDashes = v => typeof v === 'string' ? v.replace(/\s+[–—]\s+/g, ', ').replace(/[–—]/g, '-')
+  : Array.isArray(v) ? v.map(noDashes) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [k, noDashes(x)])) : v;
+const fmt = transcript => transcript.map(u => `${u.id} [${u.speaker}]: ${u.text}`).join('\n');
+// Documents later in the flow (FK, employer) also get the doctor's journal note as context; evidence must still cite transcript lines.
+const withJournal = j => (j ? `\n\nJournalanteckning (granskad av läkaren, som sammanhang; evidence ska fortfarande vara transkriptets rad-ID:n):\n${j}` : '');
+const GROUNDING = 'Använd ENDAST information som finns i transkriptet. Hitta aldrig på fynd, mätvärden, diagnoser eller uppgifter. Varje mening ska ha evidence = ID:n för de rader som stöder den. Använd inte tankstreck (– eller —). Samtalet kan vara på ett annat språk än svenska; skriv ändå alltid dokumentet på svenska.';
+
+export async function analyze({ transcript, journal, lang }, opts = {}) {
+  const { out: cert, usage } = await llm(Certificate, SYSTEM, `Transkript:\n${fmt(transcript)}${withJournal(journal)}\n\nSkriv utkastet.`, opts);
+  return { cert, checks: runChecks(cert, transcript, lang), usage };
+}
+
+// After recording: label speakers, flag likely misrecognised words, summarise. Never rewrites the transcript.
+const Processed = z.object({
+  segments: z.array(z.object({
+    id: z.string(),
+    speaker: z.enum(['Läkare', 'Patient']),
+    suspect_words: z.array(z.string()).describe('Words in this segment that look like speech-recognition errors (exact words as written)'),
+  })),
+  title: z.string().describe('Short Swedish title, e.g. "Ländryggssmärta, lagerarbetare"'),
+  summary: z.string().describe('2-3 sentence clinical summary in Swedish'),
+});
+async function processTranscript({ transcript, lang }) {
+  const { out } = await llm(Processed,
+    'Du får ett automatiskt transkriberat samtal mellan läkare och patient i svensk primärvård, uppdelat i segment utan talarangivelse. Avgör för varje segment vem som talar utifrån innehållet (läkaren ställer frågor, undersöker, bedömer; patienten beskriver besvär). Markera ord som troligen är feltolkade av taligenkänningen (t.ex. medicinska termer som blivit fel). Skriv en kort sammanfattning. ' + GROUNDING,
+    `Språk (taligenkänning): ${lang || 'sv-SE'}. Titel och sammanfattning på svenska; suspect_words exakt som de står i segmenten.\nSegment:\n${transcript.map(u => `${u.id}: ${u.text}`).join('\n')}`, { effort: 'low' });
+  return out;
+}
+
+const Journal = z.object({
+  sections: z.array(z.object({ heading: z.string(), claims: z.array(Claim) }))
+    .describe('Swedish journal note with the headings Kontaktorsak, Anamnes, Status, Bedömning, Åtgärd (skip a heading only if nothing was said about it)'),
+});
+const Arb = z.object({
+  work_capacity_reduced: z.boolean(),
+  degree: z.enum(['25', '50', '75', '100', '0']),
+  days: z.number().int(),
+  description: z.array(Claim).describe('How work capacity is reduced in relation to the job - WITHOUT diagnosis or medical details (employer must not get the diagnosis)'),
+  adjustments: z.array(Claim).describe('Possible adjustments at work that could enable partial work, only if discussed'),
+});
+const DOCS = {
+  journal: { schema: Journal, system: 'Du skriver ett utkast till journalanteckning för läkare i svensk primärvård utifrån ett transkriberat besök. Kort, sakligt journalspråk. ' + GROUNDING },
+  arb: { schema: Arb, system: 'Du skriver ett utkast till läkarintyg om arbetsförmåga till arbetsgivare (sjuklöneperioden). Arbetsgivaren får INTE veta diagnos eller medicinska detaljer. Beskriv bara hur arbetsförmågan påverkas i relation till arbetet. ' + GROUNDING },
+};
+export async function generateDoc(kind, { transcript, journal }) {
+  const d = DOCS[kind];
+  const { out } = await llm(d.schema, d.system, `Transkript:\n${fmt(transcript)}${withJournal(journal)}`);
+  return out;
+}
+
+const api = createApi({ analyze, generateDoc, processTranscript });
+const TYPES = { '.svg': 'image/svg+xml', '.webp': 'image/webp', '.png': 'image/png', '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
+if (!process.env.NO_SERVER) await init();
+if (!process.env.NO_SERVER) http.createServer(async (req, res) => {
+  // Optional password (HTTP Basic auth, any username) so a public URL can't spend the API key.
+  if (ACCESS_PASSWORD) {
+    const [, b64] = (req.headers.authorization || '').split(' ');
+    const pass = b64 ? Buffer.from(b64, 'base64').toString().split(':').slice(1).join(':') : '';
+    if (pass !== ACCESS_PASSWORD) {
+      res.writeHead(401, { 'www-authenticate': 'Basic realm="Intygskollen", charset="UTF-8"' });
+      return res.end('Lösenord krävs');
+    }
+  }
+  try {
+    if (req.url === '/api/status') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ keyConfigured: KEY_OK }));
+    }
+    if (await api(req, res)) return;
+    if (req.method === 'POST' && req.url === '/api/pdf') {
+      let body = '';
+      for await (const c of req) body += c;
+      const pdf = await buildFk7804(JSON.parse(body));
+      res.writeHead(200, { 'content-type': 'application/pdf', 'content-disposition': 'attachment; filename="FK7804-utkast.pdf"' });
+      return res.end(Buffer.from(pdf));
+    }
+    const route = { '/api/process': processTranscript, '/api/journal': b => generateDoc('journal', b), '/api/arb': b => generateDoc('arb', b) }[req.url];
+    if (req.method === 'POST' && route) {
+      let body = '';
+      for await (const c of req) body += c;
+      const result = await route(JSON.parse(body));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify(result));
+    }
+    if (req.method === 'POST' && req.url === '/api/analyze') {
+      let body = '';
+      for await (const c of req) body += c;
+      const result = await analyze(JSON.parse(body));
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify(result));
+    }
+    const path = req.url === '/' ? '/index.html' : req.url.split('?')[0];
+    if (path.includes('..')) throw Object.assign(new Error('bad path'), { status: 400 });
+    const data = await readFile(join(import.meta.dirname, 'public', path));
+    res.writeHead(200, { 'content-type': TYPES[extname(path)] || 'application/octet-stream', 'cache-control': 'no-store' });
+    res.end(data);
+  } catch (e) {
+    const status = e.code === 'ENOENT' ? 404 : e instanceof Anthropic.APIError ? (e.status || 502) : e.status || 500;
+    console.error(e.message);
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: e.message }));
+  }
+}).listen(PORT, () => console.log(`Intygskollen on http://localhost:${PORT}`));

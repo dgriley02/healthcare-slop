@@ -1,0 +1,494 @@
+// Client for Intygskollen. All recordings, audio and documents live on the server (store.mjs) so phone and
+// desktop stay in sync: the server pushes a "change" event over SSE and every open client refetches.
+// Nothing patient-related is written to browser storage; only UI preferences (Vim mode) are stored locally.
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const ICON = {
+  mic: '<svg viewBox="0 0 24 24"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-2.1a7 7 0 0 0 6-6.9h-2Z"/></svg>',
+  stop: '<svg viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>',
+  play: '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7Z"/></svg>',
+  pause: '<svg viewBox="0 0 24 24"><path d="M7 5h4v14H7zm6 0h4v14h-4z"/></svg>',
+  more: '<svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>',
+  back: '<svg viewBox="0 0 24 24"><path d="M15.4 7.4 14 6l-6 6 6 6 1.4-1.4L10.8 12Z"/></svg>',
+};
+const fmtDur = s => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const fmtTime = d => new Date(d).toLocaleString('sv-SE', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+const BAR_MS = 60; // one waveform bar per 60 ms while recording
+
+/* ---------- preferences (per device; no patient data) ---------- */
+const pref = { get: k => { try { return localStorage.getItem('ik.' + k); } catch { return null; } },
+  set: (k, v) => { try { localStorage.setItem('ik.' + k, v); } catch {} } };
+const vimOn = () => pref.get('vim') === '1';
+// Speech-recognition languages (the browser recognises one language per recording). Documents are always written in Swedish.
+const LANGS = { 'sv-SE': 'Svenska', 'en-US': 'Engelska (USA)', 'en-GB': 'Engelska (UK)', 'he-IL': 'Hebreiska', 'ar-SA': 'Arabiska', 'fa-IR': 'Persiska',
+  'so-SO': 'Somaliska', 'ti-ER': 'Tigrinja', 'tr-TR': 'Turkiska', 'ku-TR': 'Kurdiska', 'uk-UA': 'Ukrainska', 'ru-RU': 'Ryska', 'pl-PL': 'Polska',
+  'bs-BA': 'Bosniska', 'sr-RS': 'Serbiska', 'fi-FI': 'Finska', 'da-DK': 'Danska', 'nb-NO': 'Norska', 'de-DE': 'Tyska', 'fr-FR': 'Franska',
+  'es-ES': 'Spanska', 'it-IT': 'Italienska', 'pt-PT': 'Portugisiska', 'zh-CN': 'Kinesiska', 'th-TH': 'Thailändska', 'vi-VN': 'Vietnamesiska' };
+const recLang = () => LANGS[pref.get('lang')] ? pref.get('lang') : 'sv-SE';
+
+/* ---------- server state ---------- */
+const PATIENTS = [ // synthetic demo patients
+  { id: 'P1', name: 'Erik Lund', age: 34 }, { id: 'P2', name: 'Sara Holm', age: 41 }, { id: 'P3', name: 'Amira Haddad', age: 52 },
+];
+let recordings = [], retentionDays = 7, online = true;
+const ui = {}; // per-recording view state that is local to this device: { open, vimEditing, wantOpen }
+const uiOf = r => (ui[r.id] ??= {});
+async function api(method, url, body, type = 'application/json') {
+  const res = await fetch(url, { method, headers: body ? { 'content-type': type } : {}, body: type === 'application/json' && body ? JSON.stringify(body) : body });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+async function load() {
+  try {
+    const d = await api('GET', '/api/recordings');
+    recordings = d.recordings; retentionDays = d.retentionDays; online = true;
+    for (const r of recordings) { // open a document automatically once the generation this device asked for is done
+      const u = uiOf(r);
+      if (u.wantOpen && r.docs[u.wantOpen]?.data) { u.open = u.wantOpen; u.wantOpen = null; }
+      if (u.wantOpen && r.docs[u.wantOpen]?.error) u.wantOpen = null;
+    }
+  } catch { online = false; }
+  render();
+}
+// Live sync: re-render on every server change, but never while the user is typing or editing.
+let dirty = false;
+const busy = () => { const a = document.activeElement; return a && (a.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(a.tagName)) || Object.values(ui).some(u => u.vimEditing); };
+function render() { if (busy()) { dirty = true; return; } dirty = false; route(); }
+document.addEventListener('focusout', () => setTimeout(() => dirty && render(), 0));
+new EventSource('/api/events').onmessage = () => load();
+// Fallback: some tunnels/proxies buffer SSE, so also poll (cheap: one small JSON request).
+let lastPoll = '';
+setInterval(async () => {
+  try { const t = await (await fetch('/api/recordings')).text(); if (t !== lastPoll) { const first = !lastPoll; lastPoll = t; if (!first) load(); } } catch {}
+}, 4000);
+
+/* ---------- router ---------- */
+const find = id => recordings.find(x => x.id === id);
+function route() {
+  const h = location.hash, m = h.match(/^#\/r\/(R\d+)/), r = m && find(m[1]);
+  const section = h.startsWith('#/patienter') ? 'patienter' : h.startsWith('#/installningar') ? 'installningar' : 'inspelning';
+  document.querySelectorAll('.rail a[data-nav]').forEach(a => a.classList.toggle('on', a.dataset.nav === section));
+  if (!r) player.pause();
+  if (r) renderDetail(r);
+  else if (section === 'patienter') renderPatients();
+  else if (section === 'installningar') renderSettings();
+  else if (rec) refreshList(); // keep the live recorder intact while recording
+  else renderRecord();
+}
+window.addEventListener('hashchange', () => { dirty = false; route(); });
+const onDetail = r => location.hash === `#/r/${r.id}`;
+
+/* ---------- recording view ---------- */
+let rec = null, openMenu = null;
+function listHtml() {
+  if (!online && !recordings.length) return '<li class="muted small">Kan inte nå servern.</li>';
+  return recordings.slice().reverse().map(r => `
+    <li><a href="#/r/${r.id}"><b>${r.id}</b><span class="t">${esc(r.title)}</span>
+      <span class="m">${r.processing ? '<span class="pill warn">Bearbetar…</span>' : `${fmtTime(r.createdAt)} · ${fmtDur(r.duration)}${r.audio ? ' · ljud' : ''}`}</span></a>
+      <div class="menu-wrap"><button class="icon more" data-menu="${r.id}" aria-label="Fler val">${ICON.more}</button>
+        ${openMenu === r.id ? `<div class="menu"><a href="#/r/${r.id}">Öppna</a><button data-rename="${r.id}">Byt namn</button><button data-del="${r.id}" class="bad">Ta bort</button></div>` : ''}</div></li>`).join('');
+}
+function refreshList() { const l = $('#list'); if (l) l.innerHTML = listHtml(); }
+function renderRecord() {
+  $('#view').innerHTML = `
+    <div class="rec-layout">
+      <section class="stage">
+        <div class="wave-wrap"><canvas id="wave"></canvas></div>
+        <div class="timer" id="timer">${rec ? fmtDur((Date.now() - rec.start) / 1000) : '0:00'}</div>
+        <button class="recbtn ${rec ? 'on' : ''}" id="recbtn" aria-label="Starta/stoppa inspelning">${rec ? ICON.stop : ICON.mic}</button>
+        <p class="live" id="live"></p>
+        <p class="hint" id="hint">${rec ? 'Spelar in. Tryck för att stoppa.' : 'Tryck för att börja spela in samtalet'}</p>
+        <label class="langpick">Språk <select id="lang" ${rec ? 'disabled' : ''}>${Object.entries(LANGS).map(([c, n]) => `<option value="${c}" ${c === (rec?.lang || recLang()) ? 'selected' : ''}>${n}</option>`).join('')}</select></label>
+      </section>
+      <aside class="list"><h2>Inspelningar</h2><ul id="list">${listHtml()}</ul>
+        <p class="privacy">Synkas mellan dina enheter. Demo: använd bara rollspelade samtal, ingen riktig patientdata.</p></aside>
+    </div>`;
+  $('#recbtn').onclick = () => (rec ? stopRecording() : startRecording());
+  $('#lang').onchange = e => pref.set('lang', e.target.value);
+  $('#list').onclick = async e => {
+    const t = e.target.closest('[data-menu],[data-del],[data-rename]'); if (!t) return;
+    const { menu, del, rename } = t.dataset;
+    if (menu) { openMenu = openMenu === menu ? null : menu; return refreshList(); }
+    openMenu = null;
+    if (del && confirm(`Ta bort ${del}? Ljud, transkript och dokument raderas på alla enheter.`)) await api('DELETE', `/api/recordings/${del}`).catch(err => alert(err.message));
+    if (rename) { const n = prompt('Nytt namn', find(rename)?.title); if (n?.trim()) await api('PATCH', `/api/recordings/${rename}`, { title: n.trim() }).catch(err => alert(err.message)); }
+    refreshList();
+  };
+  drawLive(rec?.bars || []);
+}
+document.addEventListener('click', e => { if (openMenu && !e.target.closest('.menu-wrap')) { openMenu = null; refreshList(); } });
+
+function setupCanvas(c) {
+  const dpr = devicePixelRatio || 1;
+  c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr); return g;
+}
+function drawLive(bars) {
+  const c = $('#wave'); if (!c) return;
+  const g = setupCanvas(c), w = c.clientWidth, h = c.clientHeight, step = 4, view = bars.slice(-(Math.floor(w / step) - 10));
+  g.fillStyle = '#d0d5dd'; g.fillRect(0, h / 2 - 0.5, w, 1);
+  g.fillStyle = '#e73534';
+  view.forEach((v, i) => { const bh = Math.max(2, v * h * 0.9); g.fillRect(i * step, (h - bh) / 2, 2.5, bh); });
+  g.fillStyle = '#101828'; g.fillRect(view.length * step, 4, 2, h - 8);
+}
+
+async function startRecording() {
+  const state = { bars: [], start: Date.now(), chunks: [], segments: [], lang: recLang() };
+  try {
+    state.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    state.ctx = new AudioContext();
+    state.analyser = state.ctx.createAnalyser(); state.analyser.fftSize = 1024;
+    state.ctx.createMediaStreamSource(state.stream).connect(state.analyser);
+    state.mr = new MediaRecorder(state.stream); // saves the audio so the doctor can listen back
+    state.mr.ondataavailable = e => e.data.size && state.chunks.push(e.data);
+    state.mr.start(1000);
+  } catch { state.simulated = true; }
+  rec = state; renderRecord();
+  if (state.simulated) $('#hint').textContent = 'Ingen mikrofon, inget ljud sparas';
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (SR) { // live Swedish speech recognition (Chrome sends audio to Google, demo only)
+    const sr = new SR(); sr.lang = state.lang; sr.continuous = true; sr.interimResults = true;
+    sr.onresult = e => {
+      let interim = '';
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        state.phraseStart ??= (Date.now() - state.start) / 1000; // when this phrase began, for click-to-play
+        if (res.isFinal) {
+          state.segments.push({ text: res[0].transcript.trim(), conf: res[0].confidence || 0.9, start: Math.max(0, state.phraseStart - 0.5) });
+          state.phraseStart = null;
+        } else interim += res[0].transcript;
+      }
+      state.interim = interim;
+      const l = $('#live'); if (l && rec === state) l.textContent = [...state.segments.slice(-2).map(x => x.text), interim].join(' ').trim();
+    };
+    sr.onerror = e => {
+      state.srError = e.error;
+      if (e.error === 'audio-capture') state.analyser = null; // mic busy on some phones: continue without live waveform
+      if (!['no-speech', 'aborted'].includes(e.error)) { const h = $('#hint'); if (h && rec === state) h.textContent = `Taligenkänning: ${e.error}`; }
+    };
+    sr.onend = () => { if (rec === state) try { sr.start(); } catch {} };
+    try { sr.start(); state.sr = sr; } catch {}
+  }
+  const buf = new Uint8Array(1024);
+  state.timer = setInterval(() => {
+    let v = 0.1 + Math.random() * 0.4;
+    if (state.analyser) { state.analyser.getByteTimeDomainData(buf); v = Math.sqrt(buf.reduce((s, x) => s + ((x - 128) / 128) ** 2, 0) / buf.length) * 4; }
+    state.bars.push(Math.min(1, v));
+    if (rec === state) { drawLive(state.bars); const t = $('#timer'); if (t) t.textContent = fmtDur((Date.now() - state.start) / 1000); }
+  }, BAR_MS);
+}
+
+// Stopping creates the recording on the server and returns to an idle recorder right away.
+// Audio upload and transcript processing continue in the background; all devices see the result.
+async function stopRecording() {
+  const state = rec; rec = null;
+  clearInterval(state.timer);
+  const duration = (Date.now() - state.start) / 1000;
+  const bars = state.bars.filter((_, i) => i % 2 === 0).map(v => +v.toFixed(2)); // half resolution is plenty for display
+  renderRecord();
+  const created = api('POST', '/api/recordings', { duration, bars }).catch(e => (alert(`Kunde inte spara inspelningen: ${e.message}`), null));
+
+  const srDone = state.sr ? new Promise(res => { state.sr.onend = res; state.sr.stop(); setTimeout(res, 1500); }) : null;
+  const audioDone = state.mr?.state === 'recording' ? new Promise(res => { state.mr.onstop = res; state.mr.stop(); }) : null;
+  await Promise.all([srDone, audioDone]);
+  state.stream?.getTracks().forEach(t => t.stop()); state.ctx?.close();
+  if (state.interim?.trim()) state.segments.push({ text: state.interim.trim(), conf: 0.6, start: Math.max(0, (state.phraseStart ?? duration) - 0.5) });
+
+  const r = await created; if (!r) return;
+  if (state.chunks.length) await api('PUT', `/api/recordings/${r.id}/audio`, new Blob(state.chunks, { type: state.mr.mimeType }), state.mr.mimeType || 'audio/webm').catch(() => {});
+  await api('POST', `/api/recordings/${r.id}/transcript`, { segments: state.segments, srError: state.srError, noSpeechRecognition: !state.sr, lang: state.lang }).catch(() => {});
+}
+
+/* ---------- playback ---------- */
+const player = new Audio(); // one element for the whole app, so re-rendering never interrupts playback
+let playingId = null;
+player.addEventListener('loadedmetadata', () => { // MediaRecorder webm lacks a duration: make the browser compute it so seeking works
+  if (player.duration === Infinity) { player.currentTime = 1e9; player.addEventListener('timeupdate', () => { player.currentTime = 0; }, { once: true }); }
+});
+['timeupdate', 'play', 'pause', 'ended'].forEach(ev => player.addEventListener(ev, () => updatePlayer()));
+function loadAudio(r) { if (r.audio && playingId !== r.id) { playingId = r.id; player.src = `/api/recordings/${r.id}/audio`; } }
+function seek(r, t) {
+  if (!r.audio) return;
+  loadAudio(r); player.currentTime = Math.max(0, Math.min(t, r.duration)); player.play();
+}
+function updatePlayer() {
+  const r = playingId && find(playingId); if (!r || !onDetail(r)) return;
+  const t = player.currentTime || 0;
+  drawPlayer(r, t);
+  const b = $('#playbtn'); if (b) b.innerHTML = player.paused ? ICON.play : ICON.pause;
+  const tm = $('#ptime'); if (tm) tm.textContent = `${fmtDur(Math.min(t, r.duration))} / ${fmtDur(r.duration)}`;
+  const cur = player.paused ? null : r.transcript.filter(u => u.start <= t).pop();
+  document.querySelectorAll('.tline.playing').forEach(x => x.id !== cur?.id && x.classList.remove('playing'));
+  if (cur) document.getElementById(cur.id)?.classList.add('playing');
+}
+function drawPlayer(r, t = 0) {
+  const c = $('#pwave'); if (!c || !r.bars.length) return;
+  const g = setupCanvas(c), w = c.clientWidth, h = c.clientHeight, n = Math.max(1, Math.floor(w / 3)), at = Math.min(1, t / r.duration);
+  for (let i = 0; i < n; i++) {
+    const slice = r.bars.slice(Math.floor(i / n * r.bars.length), Math.ceil((i + 1) / n * r.bars.length));
+    const bh = Math.max(2, (slice.length ? Math.max(...slice) : 0.05) * h * 0.9);
+    g.fillStyle = i / n < at ? '#e73534' : '#f1d1d0'; g.fillRect(i * 3, (h - bh) / 2, 2, bh);
+  }
+  g.fillStyle = 'rgba(16,24,40,.25)';
+  r.transcript.forEach(u => g.fillRect(u.start / r.duration * w, 0, 1, 5)); // where each transcript line starts
+  g.fillStyle = '#101828'; g.fillRect(at * w, 0, 2, h);
+}
+
+/* ---------- detail view: transcript + document flow ---------- */
+const FLOW = {
+  journal: { label: 'Journal', desc: 'Journalanteckning från samtalet', needs: null },
+  fk: { label: 'FK-intyg', desc: 'Läkarintyg för sjukpenning (FK 7804)', needs: 'journal' },
+  arb: { label: 'Arbetsgivare', desc: 'Intyg om arbetsförmåga, utan diagnos', needs: 'journal' },
+};
+function renderDetail(r) {
+  const u = uiOf(r);
+  if (u.open && !r.docs[u.open]?.data) u.open = null; // e.g. deleted or regenerated on another device
+  loadAudio(r);
+  const keep = { t: $('#transcript')?.scrollTop, s: $('.side-col')?.scrollTop, id: $('.detail')?.dataset.id }; // keep scroll on live re-render
+  const conf = c => (c < 0.6 ? 'low' : c < 0.85 ? 'mid' : '');
+  const patient = PATIENTS.find(p => p.id === r.patient);
+  const lines = r.transcript.map(x => `
+    <div class="tline" id="${x.id}" data-t="${x.start ?? ''}"><span class="spk ${x.speaker === 'Läkare' ? 'sl' : x.speaker === 'Patient' ? 'sp' : ''}">${{ Läkare: 'läk:', Patient: 'pat:' }[x.speaker] || 'tal:'}</span>
+      <span dir="auto">${x.words.map(w => conf(w.c) ? `<span class="w ${conf(w.c)}" title="Konfidens ${Math.round(w.c * 100)} %">${esc(w.w)}</span>` : esc(w.w)).join(' ')}</span>
+      <span class="ts">${x.start != null ? fmtDur(x.start) : ''}</span></div>`).join('');
+  $('#view').innerHTML = `
+    <div class="detail" data-id="${r.id}">
+      <header class="dhead"><a href="#/" class="icon back" aria-label="Tillbaka">${ICON.back}</a>
+        <div><h1>${r.id} · ${esc(r.title)}</h1><span class="muted small">${patient ? esc(patient.name) + ' · ' : ''}${fmtTime(r.createdAt)} · ${fmtDur(r.duration)}${r.lang && !r.lang.startsWith('sv') ? ` · samtal på ${LANGS[r.lang] || r.lang}, dokument på svenska` : ''}</span></div></header>
+      <div class="dgrid ${u.open ? 'doc-open' : ''}">
+        <article class="card tcard">
+          ${r.note ? `<p class="mock">${esc(r.note)}</p>` : ''}
+          ${r.processing ? '<p class="muted">Bearbetar inspelningen: identifierar talare och sammanfattar…</p>' : r.summary ? `<p class="summary">${esc(r.summary)}</p>` : ''}
+          <div class="trow"><h2>Transkribering</h2><span class="legend"><i class="w mid">osäker</i><i class="w low">mycket osäker</i></span></div>
+          <div class="transcript" id="transcript">${lines || `<p class="muted">${r.processing ? 'Väntar på transkriptet…' : 'Inget transkript.'}</p>`}</div>
+          <div class="player ${r.audio ? '' : 'noaudio'}">
+            <button class="icon playbtn" id="playbtn" ${r.audio ? '' : 'disabled'} aria-label="Spela/pausa">${ICON.play}</button>
+            <canvas id="pwave"></canvas>
+            <span class="ptime" id="ptime">${r.audio ? `0:00 / ${fmtDur(r.duration)}` : r.example ? 'Exempel, inget ljud' : r.audioDeleted ? 'Ljudet raderat' : 'Inget ljud'}</span>
+          </div>
+          <p class="retention">${retentionText(r)}</p>
+        </article>
+        <section class="side-col card">${u.open ? docPanel(r) : flowHtml(r)}</section>
+      </div>
+    </div>`;
+  if (keep.id === r.id) { if (keep.t != null) $('#transcript').scrollTop = keep.t; if (keep.s != null) $('.side-col').scrollTop = keep.s; }
+  drawPlayer(r, playingId === r.id ? player.currentTime : 0); updatePlayer();
+  if (u.open === 'journal' && u.vimEditing) mountVim(r);
+  $('#playbtn').onclick = () => { loadAudio(r); player.paused ? player.play() : player.pause(); };
+  $('#pwave').onclick = e => { const b = e.target.getBoundingClientRect(); seek(r, (e.clientX - b.left) / b.width * r.duration); };
+  $('#transcript').onclick = e => { const l = e.target.closest('.tline'); if (l?.dataset.t) seek(r, +l.dataset.t); };
+  $('.side-col').onclick = async e => {
+    const act = (method, path, body) => api(method, `/api/recordings/${r.id}/${path}`, body).catch(err => alert(err.message));
+    const n = e.target.closest('[data-node]');
+    if (n) {
+      const k = n.dataset.node, d = r.docs[k];
+      if (d?.data) { u.open = k; return renderDetail(r); }
+      if (!d?.loading && canRun(r, k)) { u.wantOpen = k; act('POST', `generate/${k}`); }
+      return;
+    }
+    if (e.target.closest('[data-close]')) { u.open = null; return renderDetail(r); }
+    if (e.target.closest('[data-regen]')) { const k = u.open; u.open = null; u.wantOpen = k; return act('POST', `generate/${k}`); }
+    if (e.target.closest('[data-vimedit]')) { u.vimEditing = true; return renderDetail(r); }
+    if (e.target.closest('[data-webcert]')) {
+      if (confirm('Skicka FK 7804 till Försäkringskassan via Webcert?\n\n(Demo: överföringen simuleras.)')) act('POST', 'webcert');
+      return;
+    }
+    if (e.target.closest('[data-sign]')) return act('POST', `sign/${u.open}`);
+    const el = e.target.closest('[data-ev]'); if (!el) return;
+    document.querySelectorAll('.tline.hl').forEach(x => x.classList.remove('hl'));
+    const ids = el.dataset.ev.split(',').filter(Boolean);
+    ids.forEach(id => document.getElementById(id)?.classList.add('hl'));
+    document.getElementById(ids[0])?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  };
+}
+const canRun = (r, k) => !r.processing && r.transcript.length && (!FLOW[k].needs || r.docs[FLOW[k].needs]?.data);
+function retentionText(r) {
+  if (r.example) return '';
+  if (r.audioDeleted) return `Ljudet raderades ${retentionDays} dagar efter signering. Texten finns kvar.`;
+  if (!r.audio) return '';
+  if (r.signedAt) return `Signerat ${fmtTime(r.signedAt)}. Ljudet raderas automatiskt ${fmtTime(Date.parse(r.signedAt) + retentionDays * 864e5)}.`;
+  return `Ljudet sparas tills ett dokument signerats och raderas ${retentionDays} dagar därefter.`;
+}
+
+function flowHtml(r) {
+  const node = k => {
+    const f = FLOW[k], d = r.docs[k] || {}, ok = canRun(r, k);
+    const state = d.loading ? 'loading' : d.data ? 'done' : d.error ? 'error' : ok ? 'ready' : 'locked';
+    const action = { loading: 'Skapar…', done: d.signed ? 'Signerad' : 'Öppna', error: 'Försök igen', ready: 'Skapa', locked: f.needs ? 'Skapa journal först' : 'Väntar på transkript' }[state];
+    return `<button class="node ${state}" data-node="${k}" ${state === 'locked' ? 'disabled' : ''}>
+      <span class="nl">${f.label}</span><span class="nd">${f.desc}</span><span class="na">${state === 'loading' ? '<i class="mini-spin"></i>' : ''}${action}</span>
+      ${d.error ? `<span class="ne">${esc(d.error)}</span>` : ''}</button>`;
+  };
+  return `<h2>Dokument</h2>
+    <div class="tree">
+      <div class="node done static"><span class="nl">Transkript</span><span class="nd">${r.processing ? 'Bearbetas…' : `${r.transcript.length} repliker`}</span></div>
+      <div class="edge"></div>${node('journal')}
+      <div class="fork"><div>${node('fk')}</div><div>${node('arb')}</div></div>
+    </div>`;
+}
+function docPanel(r) {
+  const u = uiOf(r), k = u.open, d = r.docs[k];
+  if (k === 'journal' && u.vimEditing) return `<div class="dochead"><b>Redigera journal (Vim)</b><span class="muted small">:w sparar · :q avbryter</span></div>
+    <div id="vimHost" class="vimhost"><div class="spinner"></div></div>
+    <div class="vimbar"><span id="vimMode">-- NORMAL --</span><span class="muted small">Källhänvisningar [U3] i slutet av raden behålls.</span></div>
+    <div class="actions"><button class="btn" id="vimCancel">Avbryt</button> <button class="btn pri" id="vimSave">Spara</button></div>`;
+  return `<div class="dochead"><button class="btn sm" data-close>&larr; Flöde</button><span>${k === 'journal' && vimOn() ? '<button class="btn sm" data-vimedit>Redigera (Vim)</button> ' : ''}<button class="btn sm" data-regen>Skapa om</button></span></div>
+    ${{ fk: fkHtml, journal: journalHtml, arb: arbHtml }[k](d.data)}
+    ${k === 'fk' ? webcertHtml(d) : ''}
+    <div class="actions">${k === 'fk' ? '<button class="btn" id="pdfBtn">Ladda ner FK 7804 (PDF)</button> ' : ''}
+      <button class="btn pri" data-sign ${d.signed ? 'disabled' : ''}>${d.signed ? `Signerat ${fmtTime(d.signed)}` : 'Signera'}</button></div>`;
+}
+
+// Webcert: DEMO ONLY. Sending is simulated on the server; there is no real Webcert integration.
+function webcertHtml(d) {
+  if (d.sent) return `<div class="webcert sent"><b>Skickat till Försäkringskassan via Webcert</b><span>${fmtTime(d.sent)} · simulerat i demon, ingen riktig överföring</span></div>`;
+  if (d.sending) return '<div class="webcert"><i class="mini-spin"></i> Skickar via Webcert…</div>';
+  return `<div class="webcert"><button class="btn pri" data-webcert ${d.signed ? '' : 'disabled'}>Skicka via Webcert</button>
+    <span class="muted small">${d.signed ? 'Demo: simulerad överföring till Försäkringskassan.' : 'Signera intyget först.'}</span></div>`;
+}
+
+/* ---------- Vim editing of the journal (CodeMirror 5 + vim keymap, loaded on first use) ---------- */
+const CM_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/';
+let cmLoading;
+function loadCodeMirror() {
+  const css = Object.assign(document.createElement('link'), { rel: 'stylesheet', href: CM_BASE + 'codemirror.min.css' });
+  const js = src => new Promise((ok, fail) => document.head.append(Object.assign(document.createElement('script'), { src: CM_BASE + src, onload: ok, onerror: fail })));
+  return (cmLoading ??= (document.head.append(css), js('codemirror.min.js').then(() => js('keymap/vim.min.js'))));
+}
+// The note is edited as plain text; source references stay as [U3 U4] at the end of each line.
+const journalToText = j => j.sections.map(s => `## ${s.heading}\n${s.claims.map(c => `${c.text}${c.evidence.length ? ` [${c.evidence.join(' ')}]` : ''}`).join('\n')}`).join('\n\n');
+function textToJournal(text) {
+  const sections = [];
+  for (const line of text.split('\n')) {
+    const t = line.trim(); if (!t) continue;
+    if (t.startsWith('## ')) { sections.push({ heading: t.slice(3).trim(), claims: [] }); continue; }
+    if (!sections.length) sections.push({ heading: 'Anteckning', claims: [] });
+    const m = t.match(/^(.*?)\s*\[((?:U\d+[\s,]*)*)\]$/);
+    sections.at(-1).claims.push(m ? { text: m[1], evidence: m[2].match(/U\d+/g) || [] } : { text: t, evidence: [] });
+  }
+  return { sections };
+}
+async function mountVim(r) {
+  const host = $('#vimHost'); if (!host) return;
+  try { await loadCodeMirror(); } catch { host.innerHTML = '<p class="bad">Kunde inte ladda editorn (ingen internetanslutning?).</p>'; return; }
+  if (!document.body.contains(host)) return;
+  host.innerHTML = '';
+  const u = uiOf(r);
+  const cm = CodeMirror(host, { value: journalToText(r.docs.journal.data), keyMap: 'vim', lineWrapping: true, lineNumbers: true, autofocus: true });
+  const done = () => { u.vimEditing = false; render(); };
+  const save = async () => { await api('PUT', `/api/recordings/${r.id}/journal`, { data: textToJournal(cm.getValue()) }).catch(e => alert(e.message)); done(); };
+  CodeMirror.Vim.defineEx('write', 'w', save);
+  CodeMirror.Vim.defineEx('wq', 'wq', save);
+  CodeMirror.Vim.defineEx('quit', 'q', done);
+  CodeMirror.on(cm, 'vim-mode-change', e => { const m = $('#vimMode'); if (m) m.textContent = `-- ${e.mode.toUpperCase()} --`; });
+  $('#vimSave').onclick = save; $('#vimCancel').onclick = done;
+}
+
+/* ---------- documents ---------- */
+const refs = ids => ids.length ? `<sup>${ids.join(' ')}</sup>` : '<sup class="bad">ingen källa</sup>';
+const claimSpan = (text, ids, level = 'ok') => `<span class="claim ${level}" data-ev="${ids.join(',')}" contenteditable>${esc(text)}</span>${refs(ids)} `;
+const journalHtml = j => `<h2>Journalanteckning</h2>${j.sections.map(sec => `<h3>${esc(sec.heading)}</h3><p>${sec.claims.map(c => claimSpan(c.text, c.evidence)).join('')}</p>`).join('')}`;
+const arbHtml = a => `<h2>Intyg om arbetsförmåga till arbetsgivare</h2>
+  <p class="small muted">Innehåller ingen diagnos. Arbetsgivaren har inte rätt till medicinska uppgifter.</p>
+  <dl class="fk"><dt>Arbetsförmåga</dt><dd>${a.work_capacity_reduced ? `Nedsatt med ${a.degree} % i ${a.days} dagar` : 'Inte nedsatt'}</dd>
+  <dt>Hur den påverkas</dt><dd>${a.description.map(c => claimSpan(c.text, c.evidence)).join('') || '<em class="bad">Saknas</em>'}</dd>
+  <dt>Anpassningar</dt><dd>${a.adjustments.map(c => claimSpan(c.text, c.evidence)).join('') || '<span class="muted">Inga diskuterade</span>'}</dd></dl>`;
+
+function fkHtml({ cert: c, checks: k }) {
+  const claims = sec => c[sec].length ? c[sec].map((x, i) => claimSpan(x.text, x.evidence, k.support[`${sec}.${i}`]?.level)).join('') : '<em class="bad">Saknas</em>';
+  const flags = f => k.flags.filter(x => x.field === f).map(x => `<div class="flag ${x.severity}">${esc(x.text)}</div>`).join('');
+  const color = k.score >= 80 ? 'ok' : k.score >= 50 ? 'warn' : 'bad';
+  const DFA = { diagnosis: 'D · Diagnos', function_impairment: 'F · Funktion', activity_limitation: 'A · Aktivitet', chain: 'Kedjan' };
+  return `
+    <div class="fkhead"><h2>Läkarintyg för sjukpenning (FK 7804)</h2><div class="score ${color}">${k.score}<small>/100</small></div></div>
+    <div class="dfa-row">${Object.entries(DFA).map(([key, l]) => `<div class="dfa ${c.dfa[key].status}" title="${esc(c.dfa[key].reason)}">${l}</div>`).join('')}</div>
+    <dl class="fk">
+      <dt>Diagnos</dt><dd data-field="diagnosis">${claimSpan(`${c.diagnosis.icd10} ${c.diagnosis.text}`, c.diagnosis.evidence)}</dd>
+      <dt>Sysselsättning</dt><dd data-field="occupation">${c.occupation.text ? claimSpan(c.occupation.text, c.occupation.evidence) : '<em class="bad">Saknas</em>'}${flags('occupation')}</dd>
+      <dt>Funktionsnedsättning</dt><dd data-field="function_impairment">${claims('function_impairment')}${flags('function_impairment')}</dd>
+      <dt>Aktivitetsbegränsning</dt><dd data-field="activity_limitation">${claims('activity_limitation')}${flags('activity_limitation')}</dd>
+      <dt>Åtgärder</dt><dd data-field="treatment">${claims('treatment')}</dd>
+      <dt>Prognos</dt><dd data-field="prognosis"><span contenteditable>${esc(prognosisText(c.prognosis))}</span></dd>
+      <dt>Åtgärder för återgång</dt><dd data-field="work_measures"><span contenteditable>${esc(c.work_measures)}</span></dd>
+      <dt>Sjukskrivning</dt><dd>${claimSpan(`${c.sick_leave.degree} % i ${c.sick_leave.days} dagar`, c.sick_leave.evidence)}
+        ${k.duration ? `<div class="small muted">Rekommenderat: ${k.duration.recommended} dagar (demovärden)</div>` : ''}${flags('sick_leave')}</dd>
+    </dl>
+    ${c.questions_to_ask.length ? `<h3>Fråga innan patienten går</h3><ol>${c.questions_to_ask.map(q => `<li>${esc(q)}</li>`).join('')}</ol>` : ''}
+    <h3>Till patienten</h3><p class="patient">${esc(c.patient_summary)}</p>`;
+}
+const PROGNOSIS = {
+  full_after_end: () => 'Patienten förväntas kunna återgå helt i nuvarande sysselsättning efter detta intygs slutdatum.',
+  full_after_months: p => `Patienten förväntas kunna återgå helt i nuvarande sysselsättning efter ${p.months} månad(er).`,
+  not_full: () => 'Patienten förväntas inte kunna återgå helt i nuvarande sysselsättning.',
+  uncertain: p => `Prognosen för återgång i nuvarande sysselsättning är svårbedömd. ${p.reason}`,
+};
+const prognosisText = p => (p ? PROGNOSIS[p.option]?.(p) || '' : '');
+const isoDate = d => new Date(d).toLocaleDateString('sv-SE');
+
+// Collect the (possibly edited) certificate text from the page and download the filled FK 7804.
+async function downloadPdf(r) {
+  const c = r.docs.fk.data.cert;
+  const field = name => {
+    const dd = document.querySelector(`dd[data-field="${name}"]`); if (!dd) return '';
+    const x = dd.cloneNode(true); x.querySelectorAll('sup,.flag,.small,em').forEach(n => n.remove());
+    return x.textContent.replace(/\s+/g, ' ').trim();
+  };
+  const [icd10, ...rest] = field('diagnosis').split(' ');
+  const patient = PATIENTS.find(p => p.id === r.patient);
+  const body = {
+    patient: patient ? patient.name : 'Ny patient', personnummer: 'ÅÅÅÅMMDD-XXXX (demo)', date: isoDate(r.createdAt),
+    occupation: field('occupation'), icd10, diagnosis: rest.join(' '),
+    function_impairment: field('function_impairment'), activity_limitation: field('activity_limitation'), treatment: field('treatment'),
+    degree: c.sick_leave.degree, from: isoDate(Date.now()), to: isoDate(Date.now() + (c.sick_leave.days - 1) * 864e5), motivation: c.motivation_longer_leave,
+    prognosis_option: c.prognosis?.option, prognosis_months: c.prognosis?.months, prognosis_reason: c.prognosis?.reason,
+    work_measures: field('work_measures'), other: '',
+  };
+  const res = await fetch('/api/pdf', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  if (!res.ok) return alert('Kunde inte skapa PDF');
+  const url = URL.createObjectURL(await res.blob());
+  Object.assign(document.createElement('a'), { href: url, download: `FK7804-utkast-${r.id}.pdf` }).click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+document.addEventListener('click', e => {
+  if (e.target.id !== 'pdfBtn') return;
+  const r = recordings.find(onDetail); if (r) downloadPdf(r);
+});
+
+/* ---------- patients & settings ---------- */
+function renderPatients() {
+  $('#view').innerHTML = `<div class="page"><h1>Patienter</h1><p class="muted">Syntetiska demopatienter, ingen riktig patientdata.</p>
+    ${PATIENTS.map(p => {
+      const recs = recordings.filter(r => r.patient === p.id);
+      return `<div class="card prow"><div><b>${esc(p.name)}</b><span class="muted small"> · ${p.age} år</span></div>
+        <div class="chips">${recs.map(r => `<a class="chip" href="#/r/${r.id}">${r.id} · ${fmtTime(r.createdAt)}</a>`).join('') || '<span class="muted small">Inga inspelningar</span>'}</div></div>`;
+    }).join('')}</div>`;
+}
+async function renderSettings() {
+  const hasSR = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  $('#view').innerHTML = `<div class="page"><h1>Inställningar</h1>
+    <div class="card srow"><div><b>Claude API</b><div class="muted small">Nyckeln läses från <code>.env</code> på servern och skickas aldrig till webbläsaren.</div></div><span id="apiStatus" class="pill">Kontrollerar…</span></div>
+    <div class="card srow"><div><b>Synk</b><div class="muted small">Inspelningar, ljud och dokument sparas på servern och uppdateras live på alla inloggade enheter.</div></div><span class="pill ${online ? 'ok' : 'bad'}">${online ? 'Ansluten' : 'Offline'}</span></div>
+    <div class="card srow"><div><b>Taligenkänning</b><div class="muted small">Webbläsarens svenska taligenkänning (Chrome skickar ljudet till Google, endast demo).</div></div><span class="pill ${hasSR ? 'ok' : 'bad'}">${hasSR ? 'Tillgänglig' : 'Stöds inte'}</span></div>
+    <div class="card srow"><div><b>Ljudlagring</b><div class="muted small">Ljudet sparas så att läkaren kan lyssna om transkriptet ser fel ut, och raderas automatiskt ${retentionDays} dagar efter signering. Bara texten sparas långsiktigt.</div></div><span class="pill">Signering + ${retentionDays} dagar</span></div>
+    <div class="card srow"><div><b>Vim-läge</b><div class="muted small">Redigera journalanteckningar med Vim-kommandon (i, Esc, dd, :w, :q). Sparas på den här enheten.</div></div>
+      <label class="switch"><input type="checkbox" id="vimToggle" ${vimOn() ? 'checked' : ''}><span></span></label></div>
+    <div class="card srow"><div><b>Datahantering</b><div class="muted small">Servern loggar inga transkript. Rensa raderar allt på servern för alla enheter.</div></div><button class="btn" id="clearAll">Rensa alla inspelningar</button></div></div>`;
+  $('#vimToggle').onchange = e => pref.set('vim', e.target.checked ? '1' : '0');
+  $('#clearAll').onclick = async () => {
+    if (!confirm('Rensa alla inspelningar på servern? Det gäller alla enheter.')) return;
+    await api('DELETE', '/api/recordings').catch(e => alert(e.message)); location.hash = '#/';
+  };
+  try {
+    const s = await (await fetch('/api/status')).json();
+    $('#apiStatus').textContent = s.keyConfigured ? 'Ansluten' : 'Nyckel saknas';
+    $('#apiStatus').className = 'pill ' + (s.keyConfigured ? 'ok' : 'bad');
+  } catch { $('#apiStatus').textContent = 'Servern svarar inte'; $('#apiStatus').className = 'pill bad'; }
+}
+
+window.addEventListener('resize', () => {
+  const r = recordings.find(onDetail);
+  r ? drawPlayer(r, playingId === r.id ? player.currentTime : 0) : drawLive(rec?.bars || []);
+});
+load();

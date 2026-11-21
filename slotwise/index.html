@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Slotwise – Clinic</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <nav class="side">
+    <div class="logo"><i></i>Slotwise</div>
+    <div class="sep">Clinic</div>
+    <a href="#schedule" data-v="schedule">Schedule</a>
+    <a href="#actions" data-v="actions">Action queue <span class="count" id="cActions"></span></a>
+    <a href="#waitlist" data-v="waitlist">Waiting list <span class="count" id="cWait"></span></a>
+    <div class="sep">Insights</div>
+    <a href="#impact" data-v="impact">Impact &amp; simulation</a>
+    <a href="#model" data-v="model">Model &amp; ethics</a>
+    <div class="sep">Patients</div>
+    <a href="book.html" target="_blank">Patient portal &#8599;</a>
+    <div style="flex:1"></div>
+    <a href="#" id="reset"><span class="small">Reset demo data</span></a>
+  </nav>
+  <main class="main" id="view"></main>
+</div>
+
+<script src="model.js"></script>
+<script src="app.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+let view = location.hash.slice(1) || 'schedule';
+let offset = isWeekend(today()) ? 1 : 0, sel = null;
+const sim = { release: 0.3, accept: 0.7, threshold: 0.5, call: 0.75, cost: 1500 };
+
+/* ---------- helpers ---------- */
+const kpi = (l, v, d = '') => `<div class="kpi"><div class="l">${l}</div><div class="v">${v}</div>${d ? `<div class="d">${d}</div>` : ''}</div>`;
+const riskPill = p => `<span class="pill ${level(p)}">${pct(p)} ${LEVEL_LABEL[level(p)]}</span>`;
+const clock = t => new Date(t).toTimeString().slice(0, 5);
+function projected(b) {
+  const rec = recommend(b);
+  if (!rec) return risk(b).p;
+  if (rec.key === 'sms') return risk({ ...b, sms: true }).p;
+  return 0.75 * risk({ ...b, sms: true, confirmed: true }).p + 0.25 * risk({ ...b, sms: true }).p;
+}
+const upcoming = (days = 7) => {
+  const a = iso(today()), z = iso(addDays(today(), days));
+  return getB().filter(b => b.status === 'booked' && b.date >= a && b.date <= z);
+};
+function firstOpenSlot() {
+  for (let i = 1; i <= 21; i++) {
+    const d = addDays(today(), i); if (isWeekend(d)) continue;
+    const t = SLOTS.find(t => slotFree(iso(d), t)); if (t) return [iso(d), t];
+  }
+}
+
+/* ---------- schedule ---------- */
+function vSchedule() {
+  const mon = monday(offset), days = [0, 1, 2, 3, 4].map(i => iso(addDays(mon, i))), td = iso(today());
+  const all = getB().filter(active), wk = all.filter(b => days.includes(b.date));
+  const up = wk.filter(b => b.status === 'booked' && b.date >= td);
+  const exp = up.reduce((s, b) => s + risk(b).p, 0);
+  const open = days.filter(d => d >= td).reduce((s, d) => s + SLOTS.filter(t => !all.some(b => b.date === d && b.time === t)).length, 0);
+  const hi = up.filter(b => risk(b).p >= 0.4 && !b.confirmed).length;
+  const rec = wk.filter(b => b.source === 'waitlist').length;
+
+  const card = b => {
+    const r = risk(b), cls = b.status === 'noshow' ? 'noshow' : b.status === 'attended' ? 'done' : level(r.p);
+    const tags = [b.confirmed && 'CONFIRMED', b.sms && !b.confirmed && 'SMS SENT', b.overbook && 'OVERBOOKED', b.source === 'waitlist' && !b.overbook && 'FROM WAITLIST'].filter(Boolean).join(' · ');
+    const right = b.status === 'noshow' ? 'No-show' : b.status === 'attended' ? 'Attended' : pct(r.p);
+    return `<div class="appt ${cls} ${sel === b.id ? 'sel' : ''}" data-id="${b.id}"><div style="min-width:0"><div class="n">${esc(b.name)}</div><div class="tags">${tags || esc(b.reason)}</div></div><div class="r">${right}</div></div>`;
+  };
+  let g = '<div class="dh"></div>' + days.map(d => `<div class="dh ${d === td ? 'today' : ''}">${fmtDay(d)}</div>`).join('');
+  SLOTS.forEach(t => {
+    if (t === '13:00') g += '<div class="lunch">Lunch</div>';
+    g += `<div class="t">${t}</div>`;
+    days.forEach(d => {
+      const bs = all.filter(b => b.date === d && b.time === t), past = d < td;
+      g += `<div class="${past ? 'past' : ''}">${bs.length ? bs.map(card).join('') : past ? '' : `<button class="open" data-offer="${d}|${t}">Offer to waiting list</button>`}</div>`;
+    });
+  });
+  return `
+  <div class="top"><div><h1>Schedule</h1><div class="muted">Week of ${fmtLong(days[0])}</div></div>
+    <div class="row"><button class="btn" data-nav="-1">Previous</button><button class="btn" data-nav="0">This week</button><button class="btn" data-nav="1">Next</button></div></div>
+  <div class="kpis">
+    ${kpi('Booked this week', wk.length)}
+    ${kpi('Open slots (upcoming)', open)}
+    ${kpi('Expected no-shows (upcoming)', exp.toFixed(1), `${up.length ? pct(exp / up.length) : '0%'} of upcoming bookings`)}
+    ${kpi('High risk, unconfirmed', hi, hi ? '<a href="#actions">Open action queue</a>' : 'All covered')}
+    ${kpi('Filled from waiting list', rec)}
+  </div>
+  <div class="cols">
+    <div class="card">
+      <div class="hd"><h2>Appointments</h2><div class="legend"><span style="--c:var(--low)">Low risk</span><span style="--c:var(--med)">Elevated</span><span style="--c:var(--high)">High</span><span style="--c:#98a2b3">Completed</span></div></div>
+      <div class="cal">${g}</div>
+    </div>
+    <div class="row" style="flex-direction:column;align-items:stretch;gap:18px">${detail()}${feed()}</div>
+  </div>`;
+}
+
+function detail() {
+  const b = sel && findBooking(sel);
+  if (!b) return '<div class="card"><div class="bd muted">Select an appointment to see its no-show risk, what drives it and the recommended next step. Click an open slot to offer it to the waiting list.</div></div>';
+  const r = risk(b), lv = level(r.p), rec = recommend(b), up = b.status === 'booked';
+  const max = Math.max(0.05, ...r.factors.map(f => Math.abs(f.delta)));
+  const factors = r.factors.map(f => `<div class="factor"><span>${esc(f.label)}</span>
+    <div class="bar"><i style="left:0;width:${Math.abs(f.delta) / max * 100}%;background:var(--${f.delta > 0 ? 'high' : 'low'})"></i></div>
+    <span class="${f.delta > 0 ? 'down' : 'up'}" style="text-align:right">${f.delta > 0 ? '+' : ''}${(f.delta * 100).toFixed(1)} pp</span></div>`).join('');
+  const inSlot = slotBookings(b.date, b.time).length;
+  const canOB = up && r.p >= OVERBOOK_THRESHOLD && inSlot < 2;
+  const st = { booked: '<span class="pill blue">Booked</span>', attended: '<span class="pill grey">Attended</span>', noshow: '<span class="pill high">No-show</span>', cancelled: '<span class="pill grey">Cancelled</span>' }[b.status];
+  return `<div class="card detail">
+    <div class="hd"><div><h2>${esc(b.name)}</h2><div class="small muted">${b.ref}</div></div>${st}</div>
+    <div class="bd">
+      ${up ? `<div class="row" style="align-items:baseline"><span class="big" style="color:var(--${lv})">${pct(r.p)}</span><span class="muted">no-show risk · ${LEVEL_LABEL[lv]}</span></div>` : ''}
+      <dl class="kv"><dt>Appointment</dt><dd>${fmtDay(b.date)}, ${b.time}</dd><dt>Reason</dt><dd>${esc(b.reason)}</dd>
+        <dt>Age</dt><dd>${b.age}</dd><dt>Phone</dt><dd>${esc(b.phone)}</dd><dt>Booked</dt><dd>${fmtDay(b.createdAt)}${b.source === 'waitlist' ? ' (waiting list)' : ''}</dd>
+        <dt>Reminder</dt><dd>${b.confirmed ? 'Confirmed by patient' : b.sms ? 'SMS sent, awaiting reply' : 'Not sent'}</dd></dl>
+      ${up ? `<h3>Why this score</h3>${factors}` : ''}
+      ${up && (rec || canOB) ? `<div class="rec"><b>Recommended:</b> ${rec ? rec.label : ''}${rec && canOB ? '. ' : ''}${canOB ? `Consider overbooking – expected attendance is only ${pct(1 - r.p)}.` : ''}</div>` : ''}
+      ${up ? `<div class="actions">
+        <button class="btn ${rec?.key === 'sms' ? 'pri' : ''}" data-act="sms" ${b.sms ? 'disabled' : ''}>Send SMS</button>
+        <button class="btn ${rec?.key === 'call' ? 'pri' : ''}" data-act="call" ${b.confirmed ? 'disabled' : ''}>Call patient</button>
+        <button class="btn" data-act="confirm" ${b.confirmed ? 'disabled' : ''}>Mark confirmed</button>
+        ${canOB ? '<button class="btn" data-act="overbook">Overbook from waiting list</button>' : ''}
+        <button class="btn" data-act="attended">Attended</button>
+        <button class="btn" data-act="noshow">No-show</button>
+        <button class="btn danger" data-act="cancel">Cancel and backfill</button></div>` : ''}
+    </div></div>`;
+}
+
+function feed() {
+  const l = getLog().slice(0, 40);
+  return `<div class="card"><div class="hd"><h2>Activity</h2><span class="small muted">live</span></div>
+    <div class="feed">${l.map(e => `<div class="${e.kind}"><time>${clock(e.at)}</time><span>${esc(e.msg)}</span></div>`).join('') || '<div>No activity yet</div>'}</div></div>`;
+}
+
+/* ---------- action queue ---------- */
+function vActions() {
+  const list = upcoming().map(b => ({ b, r: risk(b), rec: recommend(b) })).sort((a, c) => c.r.p - a.r.p);
+  const now = list.reduce((s, x) => s + x.r.p, 0), after = list.reduce((s, x) => s + projected(x.b), 0);
+  const calls = list.filter(x => x.rec?.key === 'call').length, sms = list.filter(x => x.rec?.key === 'sms').length;
+  return `
+  <div class="top"><div><h1>Action queue</h1><div class="muted">Next 7 days, sorted by no-show risk</div></div>
+    <button class="btn pri" id="runAll" ${calls + sms ? '' : 'disabled'}>Run all recommended actions</button></div>
+  <div class="kpis">
+    ${kpi('Upcoming appointments', list.length)}
+    ${kpi('Expected no-shows now', now.toFixed(1))}
+    ${kpi('After recommended actions', after.toFixed(1), now ? `<span class="up">${pct((now - after) / now)} fewer empty chairs</span>` : '')}
+    ${kpi('Pending actions', calls + sms, `${sms} SMS · ${calls} calls (~${calls * 4} min staff time)`)}
+  </div>
+  <div class="card"><table>
+    <tr><th>Patient</th><th>Appointment</th><th>Risk</th><th>Main driver</th><th>Status</th><th>Recommended</th><th></th></tr>
+    ${list.map(({ b, r, rec }) => `<tr>
+      <td><b>${esc(b.name)}</b><div class="small muted">${esc(b.reason)}</div></td>
+      <td>${fmtDay(b.date)}, ${b.time}</td><td>${riskPill(r.p)}</td>
+      <td class="small">${esc(r.factors.find(f => f.delta > 0)?.label || '–')}</td>
+      <td>${b.confirmed ? '<span class="pill low">Confirmed</span>' : b.sms ? '<span class="pill blue">SMS sent</span>' : '<span class="pill grey">No contact</span>'}</td>
+      <td class="small">${rec ? rec.label : '<span class="muted">None needed</span>'}</td>
+      <td>${rec ? `<button class="btn sm ${rec.key === 'call' ? 'pri' : ''}" data-act="${rec.key}" data-id="${b.id}">${rec.key === 'call' ? 'Call' : 'Send SMS'}</button>` : ''}</td></tr>`).join('')}
+  </table></div>`;
+}
+
+/* ---------- waiting list ---------- */
+function vWaitlist() {
+  const all = getW(), ranked = rankWaitlist(), rest = all.filter(w => w.status !== 'waiting');
+  const row = (w, i) => `<tr><td>${i ?? '–'}</td><td><b>${esc(w.name)}</b><div class="small muted">${esc(w.phone)}</div></td><td>${esc(w.reason)}</td>
+    <td>${w.urgency === 'priority' ? '<span class="pill high">Priority</span>' : '<span class="pill grey">Routine</span>'}</td>
+    <td>${daysBetween(w.addedAt, iso(today()))} days</td>
+    <td>${{ waiting: '<span class="pill blue">Waiting</span>', offered: `<span class="pill med">Offered ${esc(w.offer || '')}</span>`, booked: '<span class="pill low">Booked</span>' }[w.status]}</td>
+    <td><button class="btn sm danger" data-rmw="${w.id}">Remove</button></td></tr>`;
+  return `
+  <div class="top"><div><h1>Waiting list</h1><div class="muted">Patients who want an earlier slot. Freed slots are offered automatically, priority first, then longest wait.</div></div>
+    <button class="btn pri" id="offerNext">Offer earliest open slot</button></div>
+  <div class="cols">
+    <div class="card"><table><tr><th>#</th><th>Patient</th><th>Reason</th><th>Urgency</th><th>Waiting</th><th>Status</th><th></th></tr>
+      ${ranked.map((w, i) => row(w, i + 1)).join('')}${rest.map(w => row(w)).join('')}
+      ${all.length ? '' : '<tr><td colspan="7" class="muted">Nobody on the waiting list</td></tr>'}</table></div>
+    <form class="card" id="wForm"><div class="hd"><h2>Add patient</h2></div><div class="bd">
+      <label>Name</label><input name="name" required>
+      <div class="field-row"><div><label>Age</label><input name="age" type="number" min="0" max="120" required></div>
+      <div><label>Urgency</label><select name="urgency"><option value="routine">Routine</option><option value="priority">Priority</option></select></div></div>
+      <label>Phone</label><input name="phone" required>
+      <label>Reason</label><input name="reason" value="Consultation">
+      <br><br><button class="btn pri">Add to waiting list</button></div></form>
+  </div>`;
+}
+
+/* ---------- impact ---------- */
+function vImpact() {
+  const lm = monday(-1), lastDays = [0, 1, 2, 3, 4].map(i => iso(addDays(lm, i)));
+  const last = getB().filter(b => lastDays.includes(b.date) && ['attended', 'noshow'].includes(b.status));
+  const att = last.filter(b => b.status === 'attended').length, ns = last.length - att;
+  const pred = last.reduce((s, b) => s + risk(b).p, 0);
+  const up = upcoming();
+  const base = up.reduce((s, b) => s + risk({ ...b, sms: false, confirmed: false }).p, 0), cur = up.reduce((s, b) => s + risk(b).p, 0);
+  const recovered = getB().filter(b => active(b) && b.source === 'waitlist').length;
+  const sl = (k, label, min, max, step, fmt) => `<div class="slider"><label><span>${label}</span><b id="o_${k}">${fmt(sim[k])}</b></label>
+    <input type="range" data-sim="${k}" min="${min}" max="${max}" step="${step}" value="${sim[k]}"></div>`;
+  return `
+  <div class="top"><div><h1>Impact &amp; simulation</h1><div class="muted">How many empty chairs Slotwise gives back</div></div></div>
+  <div class="kpis">
+    ${kpi('Last week no-show rate', last.length ? pct(ns / last.length) : '–', `${ns} of ${last.length} appointments`)}
+    ${kpi('Model calibration last week', `${pred.toFixed(1)} / ${ns}`, 'predicted / actual no-shows')}
+    ${kpi('Next 7 days, no intervention', base.toFixed(1), 'expected no-shows')}
+    ${kpi('Next 7 days, current plan', cur.toFixed(1), base ? `<span class="up">${pct((base - cur) / base)} reduction so far</span>` : '')}
+    ${kpi('Chairs filled from waiting list', recovered)}
+  </div>
+  <div class="card"><div class="hd"><h2>Policy simulator</h2><span class="small muted">Monte Carlo, 300 clinic-weeks of 70 slots, patients sampled like the demo population</span></div>
+    <div class="bd sim">
+      <div>
+        ${sl('release', 'Likely no-shows who cancel when asked', 0, 0.6, 0.05, pct)}
+        ${sl('accept', 'Waiting list acceptance rate', 0, 1, 0.05, pct)}
+        ${sl('call', 'Phone calls that reach patient', 0, 1, 0.05, pct)}
+        ${sl('threshold', 'Overbook when risk is above', 0.3, 1, 0.05, v => v >= 1 ? 'Off' : pct(v))}
+        ${sl('cost', 'Cost of an empty chair (SEK)', 500, 4000, 100, v => v.toLocaleString('sv-SE'))}
+        <p class="small muted">All parameters are assumptions to be validated in a pilot. Defaults are conservative.</p>
+      </div>
+      <div id="simOut"></div>
+    </div></div>`;
+}
+
+function samplePatient() {
+  const r = rnd(), lead = rnd() < 0.18 ? 0 : Math.ceil(rnd() ** 1.6 * 45);
+  return { age: Math.floor(rnd() ** 1.2 * 88) + 1, prevNoShows: r < 0.72 ? 0 : r < 0.9 ? 1 : 2, date: '2026-01-07', createdAt: iso(addDays(parse('2026-01-07'), -lead)) };
+}
+function runSim() {
+  const W = 300, N = 70; let be = 0, se = 0, col = 0, rec = 0, calls = 0;
+  for (let i = 0; i < W * N; i++) {
+    const b = samplePatient(), p0 = risk(b).p;
+    if (rnd() < p0) be++;
+    let s = { ...b, sms: true };
+    if (p0 >= 0.4) { calls++; if (rnd() < sim.call) s.confirmed = true; }
+    const p1 = risk(s).p, ns = rnd() < p1;
+    let filled = !ns;
+    if (ns && rnd() < sim.release && rnd() < sim.accept) { filled = true; rec++; }
+    if (sim.threshold < 1 && p1 >= sim.threshold && rnd() < 0.92) { if (filled) col++; else { filled = true; rec++; } }
+    if (!filled) se++;
+  }
+  const bw = be / W, sw = se / W, saved = (bw - sw) * sim.cost;
+  const bar = (label, v, max, color, txt) => `<div class="line"><span>${label}</span><div class="track"><i style="width:${v / max * 100}%;background:${color}"></i></div><b>${txt}</b></div>`;
+  $('#simOut').innerHTML = `
+    <h3>Empty chairs per week</h3><div class="cmp">
+      ${bar('Today', bw, bw, '#98a2b3', bw.toFixed(1))}${bar('With Slotwise', sw, bw, 'var(--brand-2)', sw.toFixed(1))}</div>
+    <h3>Utilisation</h3><div class="cmp">
+      ${bar('Today', 1 - bw / N, 1, '#98a2b3', pct(1 - bw / N))}${bar('With Slotwise', 1 - sw / N, 1, 'var(--brand-2)', pct(1 - sw / N))}</div>
+    <div class="kpis" style="margin:0">
+      ${kpi('Empty chairs avoided', pct((bw - sw) / bw), `${(bw - sw).toFixed(1)} per week`)}
+      ${kpi('Value per clinic and year', `${Math.round(saved * 46 / 1000).toLocaleString('sv-SE')} kSEK`, '46 working weeks')}
+      ${kpi('Double-booked arrivals', (col / W).toFixed(1), 'per week, both patients showed up')}
+      ${kpi('Staff calls', (calls / W).toFixed(0), `per week, ~${Math.round(calls / W * 4)} min`)}
+    </div>`;
+}
+
+/* ---------- model ---------- */
+function vModel() {
+  const M = MODEL, rows = (obj, name) => Object.entries(obj).map(([k, v]) => `<tr><td>${name}</td><td>${k}</td><td>${(+v).toFixed(2)}</td></tr>`).join('');
+  return `<div class="top"><div><h1>Model &amp; ethics</h1><div class="muted">How the score is made and how it may be used</div></div></div>
+  <div class="cols"><div class="card"><div class="bd prose">
+    <h2 style="margin-top:0">What the score predicts</h2>
+    <p>The probability that a booked patient does not attend and does not cancel. It is a logistic regression on features a clinic already has at booking time: how far in advance the appointment was booked, age group, the patient's earlier no-shows, weekday, and whether a reminder was sent or attendance confirmed.</p>
+    <p>Every score comes with its drivers in percentage points, so staff can see <i>why</i> a booking is flagged, not just that it is.</p>
+    <h2>Data</h2>
+    <p>${M.source === 'trained' ? `Fitted on ${M.n?.toLocaleString('sv-SE')} appointments from the Kaggle <i>Medical Appointment No Shows</i> dataset. Hold-out ROC AUC: <b>${M.auc?.toFixed(3)}</b>.` : 'Coefficients are currently set by hand from the published statistics of the Kaggle <i>Medical Appointment No Shows</i> dataset (110,527 appointments, Vitória, Brazil, 2016; about 20% no-shows). Run <code>python train/train.py</code> to replace them with fitted weights.'}
+    The dataset is licensed for non-commercial use (CC BY-NC-SA 4.0). No real patient data is used in this prototype.</p>
+    <h2>Principles</h2>
+    <ul>
+      <li><b>The score buys support, never less care.</b> A high score triggers a reminder or a phone call. It is never used to refuse, delay or deprioritise a booking.</li>
+      <li><b>Human in the loop.</b> Overbooking and phone calls are suggestions that staff accept. Only low-stakes reminders can be automated.</li>
+      <li><b>Easy to release a slot.</b> Every reminder carries a one-tap cancel link, which turns a silent no-show into a chair for someone on the waiting list.</li>
+      <li><b>Fairness monitoring.</b> Error rates should be checked per age group and area before any use. Age is used because it predicts attendance, but it must not lead to worse service for any group.</li>
+      <li><b>Data minimisation (GDPR).</b> Only data the booking system already holds. No diagnosis, no free text.</li>
+    </ul>
+    <h2>Limits</h2>
+    <p>The training data comes from Brazil in 2016. Before use in Swedish care, the model must be re-fitted and validated on local data, and the effect of reminders tested in a controlled pilot.</p>
+  </div></div>
+  <div class="card"><div class="hd"><h2>Coefficients</h2><span class="pill ${M.source === 'trained' ? 'low' : 'grey'}">${M.source}</span></div>
+    <table><tr><th>Feature</th><th>Level</th><th>Weight</th></tr>
+    <tr><td>Intercept</td><td></td><td>${M.intercept.toFixed(2)}</td></tr>
+    ${rows(M.lead, 'Lead time (days)')}${rows(M.age, 'Age')}${rows(M.prev, 'Prior no-shows')}
+    <tr><td>Reminder</td><td>sent</td><td>${M.sms.toFixed(2)}</td></tr><tr><td>Confirmed</td><td>yes</td><td>${M.confirmed.toFixed(2)}</td></tr></table></div></div>`;
+}
+
+/* ---------- render & events ---------- */
+const VIEWS = { schedule: vSchedule, actions: vActions, waitlist: vWaitlist, impact: vImpact, model: vModel };
+function render() {
+  if (!VIEWS[view]) view = 'schedule';
+  document.querySelectorAll('.side a[data-v]').forEach(a => a.classList.toggle('on', a.dataset.v === view));
+  const n = upcoming().filter(recommend).length, w = rankWaitlist().length;
+  $('#cActions').textContent = n || ''; $('#cWait').textContent = w || '';
+  $('#view').innerHTML = VIEWS[view]();
+  if (view === 'impact') runSim();
+}
+let dirty = false;
+function refresh() {
+  const a = document.activeElement;
+  if (a && $('#view').contains(a) && ['INPUT', 'SELECT'].includes(a.tagName)) { dirty = true; return; }
+  render();
+}
+window.addEventListener('sw-change', () => setTimeout(refresh));
+window.addEventListener('storage', refresh);
+document.addEventListener('focusout', () => dirty && setTimeout(() => { dirty = false; refresh(); }));
+window.addEventListener('hashchange', () => { view = location.hash.slice(1); sel = null; render(); });
+
+const ACTIONS = {
+  sms: sendSms, call: callPatient, overbook,
+  confirm: id => { updateBooking(id, { confirmed: true }); log(`${who(findBooking(id))} marked confirmed by staff`, 'ok'); },
+  attended: id => { updateBooking(id, { status: 'attended' }); log(`${findBooking(id).name} attended`, 'ok'); },
+  noshow: id => { updateBooking(id, { status: 'noshow' }); log(`${findBooking(id).name} did not attend`, 'warn'); },
+  cancel: id => cancelBooking(id, 'staff'),
+};
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-id],[data-act],[data-offer],[data-nav],[data-rmw],#runAll,#offerNext,#reset');
+  if (!t) return;
+  if (t.id === 'reset') { e.preventDefault(); seed(); sel = null; return render(); }
+  if (t.id === 'offerNext') { const s = firstOpenSlot(); s ? offerSlot(...s) : log('No open slots in the next three weeks', 'warn'); return render(); }
+  if (t.id === 'runAll') {
+    upcoming().filter(recommend).forEach((b, i) => setTimeout(() => ACTIONS[recommend(b)?.key]?.(b.id), i * 250));
+    return;
+  }
+  if (t.dataset.nav) { offset = t.dataset.nav === '0' ? (isWeekend(today()) ? 1 : 0) : offset + +t.dataset.nav; return render(); }
+  if (t.dataset.offer) { offerSlot(...t.dataset.offer.split('|')); return render(); }
+  if (t.dataset.rmw) { setW(getW().filter(w => w.id !== t.dataset.rmw)); return render(); }
+  if (t.dataset.act) { ACTIONS[t.dataset.act](t.dataset.id || sel); return render(); }
+  if (t.classList.contains('appt')) { sel = t.dataset.id; render(); }
+});
+document.addEventListener('submit', e => {
+  if (e.target.id !== 'wForm') return;
+  e.preventDefault();
+  const f = Object.fromEntries(new FormData(e.target));
+  addToWaitlist({ ...f, age: +f.age });
+  e.target.reset(); document.activeElement.blur(); render();
+});
+document.addEventListener('input', e => {
+  const k = e.target.dataset.sim; if (!k) return;
+  sim[k] = +e.target.value;
+  const fmt = { cost: v => v.toLocaleString('sv-SE'), threshold: v => v >= 1 ? 'Off' : pct(v) }[k] || pct;
+  $('#o_' + k).textContent = fmt(sim[k]);
+  runSim();
+});
+render();
+</script>
+</body>
+</html>
